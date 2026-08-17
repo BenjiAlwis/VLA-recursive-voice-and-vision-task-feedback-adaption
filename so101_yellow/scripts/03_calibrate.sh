@@ -13,6 +13,7 @@ cd "$(dirname "$0")/.."
 source .venv/bin/activate
 
 ROLE="${1:?Usage: $0 {leader|follower}}"
+ROLE="${ROLE%\}}"  # strip a stray trailing '}' some shell wrappers append to the last arg
 
 case "$ROLE" in
   leader)

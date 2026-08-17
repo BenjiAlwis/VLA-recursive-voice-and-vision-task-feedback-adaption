@@ -24,7 +24,7 @@ TASK_PROMPT="${1:?Usage: $0 \"<current text prompt from Blue>\"}"
 lerobot-rollout \
   --strategy.type=base \
   --robot.type=so101_follower --robot.port="$SO101_FOLLOWER_PORT" --robot.id="$SO101_FOLLOWER_ID" \
-  --robot.cameras="{front: {type: opencv, index_or_path: $CAM_FRONT_INDEX, width: $CAM_WIDTH, height: $CAM_HEIGHT, fps: $CAM_FPS}}" \
+  --robot.cameras="{wrist: {type: opencv, index_or_path: $CAM_WRIST_INDEX, width: $CAM_WIDTH, height: $CAM_HEIGHT, fps: $CAM_FPS}}" \
   --task="$TASK_PROMPT" \
   --policy.type=smolvla \
   --policy.pretrained_path="$POLICY_REPO_ID" \
