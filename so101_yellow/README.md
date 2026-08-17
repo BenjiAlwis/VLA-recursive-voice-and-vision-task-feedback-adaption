@@ -73,6 +73,15 @@ your arms' motors are already configured.
 
 ### 4. Calibrate both arms
 
+**Already calibrated on this exact pair of arms?** Skip the physical process
+below and restore the checked-in files instead:
+
+```bash
+./scripts/restore_calibration.sh
+```
+
+Otherwise, calibrate fresh:
+
 ```bash
 ./scripts/03_calibrate.sh leader
 ./scripts/03_calibrate.sh follower
@@ -81,10 +90,19 @@ your arms' motors are already configured.
 For each arm: move all joints to the middle of their range, press Enter, then
 physically sweep each joint through its full range of motion. This records
 homing offsets + limits to a calibration file keyed by the arm's `id`
-(`SO101_LEADER_ID` / `SO101_FOLLOWER_ID` in `configs/*.env`).
+(`SO101_LEADER_ID` / `SO101_FOLLOWER_ID` in `configs/*.env`), written to
+`~/.cache/huggingface/lerobot/calibration/...`.
 
 **Keep these ids fixed** — every later step (teleop, record, rollout) must
 use the exact same id or it will silently load the wrong calibration.
+
+**Calibration is arm-specific, not just id-specific** — these homing offsets
+and joint-range limits are physically calibrated to *this exact pair of
+SO-101 arms*. `calibration/` in this repo is version-controlled as a
+convenience for this project's own two arms (so a teammate on the same
+hardware doesn't have to redo the physical sweep), not as something to
+reuse on a different arm. If you're setting up a different SO-101 pair,
+recalibrate — don't restore these files.
 
 ### 5. Find your camera
 

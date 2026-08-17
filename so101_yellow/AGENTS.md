@@ -63,3 +63,7 @@ calibration files, don't suggest merging the two.
 - The `--robot.id`/`--teleop.id` values in `configs/*.env` are calibration
   file keys, not free-form labels — changing them orphans any existing
   calibration.
+- `calibration/` is checked into this repo (mirroring LeRobot's cache layout)
+  and restored via `scripts/restore_calibration.sh`. It is physically
+  calibrated to this project's specific two SO-101 arms — it's not portable
+  to a different arm pair, and it's not a template to copy from.
