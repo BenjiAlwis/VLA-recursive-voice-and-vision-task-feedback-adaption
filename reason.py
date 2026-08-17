@@ -63,6 +63,9 @@ NO_MOTION_CM = float(os.getenv("NO_MOTION_CM", "2.0"))
 
 _client = None
 
+# Why the last model call was unusable, for the fallback's audit trail.
+_last_error: Optional[str] = None
+
 
 def client():
     """Lazily built OpenAI-compatible client. Raises if the key is absent —
@@ -284,6 +287,20 @@ def validate(raw: Any) -> Dict:
         raise InvalidDiagnosis(
             f"failure_mode {mode!r} not in {FAILURE_MODES}")
 
+    # "Nothing is wrong" is a legitimate observation, not a malformed reply.
+    # It carries no diagnosis or correction by design, so the non-empty
+    # checks below must not reject it. Note this is NOT a success verdict:
+    # it says the observer sees no visible error, and callers treat it as
+    # "stay quiet", never as "the task passed".
+    if "needs_correction" in raw and not raw.get("needs_correction"):
+        try:
+            conf = min(1.0, max(0.0, float(raw.get("confidence", 0.5))))
+        except (TypeError, ValueError):
+            conf = 0.5
+        return {"needs_correction": False, "failure_mode": mode,
+                "diagnosis": "", "prompt_update": "",
+                "confidence": conf, "source": "vlm"}
+
     diagnosis = str(raw.get("diagnosis", "")).strip()
     if not diagnosis:
         raise InvalidDiagnosis("empty diagnosis")
@@ -302,6 +319,7 @@ def validate(raw: Any) -> Dict:
         confidence = 0.5
 
     return {
+        "needs_correction": True,
         "failure_mode": mode,
         "diagnosis": diagnosis[:MAX_DIAGNOSIS_CHARS],
         "prompt_update": prompt_update[:MAX_PROMPT_CHARS],
@@ -363,33 +381,132 @@ Diagnose the failure and give one correction."""
                 content.append({"type": "image_url",
                                 "image_url": {"url": url}})
 
-    # Build the client BEFORE the retry loop. A missing package or key is
-    # not a transient error, and retrying it just spends the demo's time
-    # twice over before falling back to the same answer.
+    result = _complete(SYSTEM, content)
+    if result is None:
+        return _fallback(task, verdict, why=_last_error or "model unusable")
+    _log_disagreement(result, verdict)
+    return result
+
+
+def _complete(system: str, content: List[Dict]) -> Optional[Dict]:
+    """One validated model reply, or None. Shared by diagnose and observe.
+
+    The client is built BEFORE the retry loop: a missing package or key is
+    not transient, and retrying it spends the demo's time twice over to
+    reach the same fallback.
+    """
+    global _last_error
+
     try:
         api = client()
     except Exception as e:                                  # noqa: BLE001
+        _last_error = f"no client: {e}"
         print(f"[reason] no model available ({e}); using geometry")
-        return _fallback(task, verdict, why=f"no client: {e}")
+        return None
 
-    last_err = None
     for attempt in range(RETRIES + 1):
         try:
             resp = api.chat.completions.create(
                 model=MODEL,
-                messages=[{"role": "system", "content": SYSTEM},
+                messages=[{"role": "system", "content": system},
                           {"role": "user", "content": content}],
                 temperature=0.3,
                 max_tokens=300,
             )
-            result = validate(resp.choices[0].message.content)
-            _log_disagreement(result, verdict)
-            return result
+            return validate(resp.choices[0].message.content)
         except Exception as e:                              # noqa: BLE001
-            last_err = e
+            _last_error = str(e)
             print(f"[reason] attempt {attempt} unusable: {e}")
+    return None
 
-    return _fallback(task, verdict, why=str(last_err))
+
+OBSERVE_SYSTEM = f"""You are looking through smart glasses worn by a person \
+watching a robot arm work. You see the scene from their point of view.
+
+Your ONLY job is to spot a visible problem and give one correction.
+
+YOU ARE NOT A JUDGE OF SUCCESS. You must never say the task is finished, \
+complete, correct, or successful, and you must never tell the arm to stop \
+or to do nothing. A separate camera measures success; you do not. If the \
+scene looks fine to you, say so with needs_correction false and nothing \
+else.
+
+Output ONLY a JSON object, no prose and no markdown fences:
+{{"needs_correction": <true|false>,
+  "failure_mode": one of {FAILURE_MODES},
+  "diagnosis": "<one sentence, first person, spoken aloud by the robot>",
+  "prompt_update": "<one imperative correction for the controller>",
+  "confidence": <float 0.0 to 1.0>}}
+
+If needs_correction is false, set failure_mode to "no_motion", leave \
+diagnosis and prompt_update as empty strings, and set confidence to how \
+sure you are that nothing is wrong.
+
+"prompt_update" goes to a controller that only understands natural \
+language. One concrete spatial correction, not a restatement of the task. \
+Good: "Move the gripper 3 centimetres right before closing." \
+Bad: "Pick up the block." Bad: "Continue as you are.\""""
+
+
+def suggest_correction(task: str, frame: Any, memories: Optional[str] = None,
+                       surface: str = "unknown",
+                       verdict: Optional[Dict] = None) -> Optional[Dict]:
+    """Look at one glasses frame and suggest a correction, or return None.
+
+    This is the interval path: a person wearing the glasses is watching, and
+    every few seconds we ask what looks wrong. It is deliberately NOT
+    diagnose():
+
+      - there is no camera verdict here, so nothing may be recorded as a
+        pass or a fail. This function CANNOT report success. The model is
+        given an explicit "you are not a judge of success" instruction, any
+        success-like key is stripped by validate(), and a reply that does
+        not ask for a correction returns None rather than anything a caller
+        could mistake for a verdict.
+      - it returns None when nothing is wrong, so a caller can poll it on a
+        timer without emitting a stream of pointless prompt updates.
+
+    If `verdict` is supplied and it says the trial passed, this returns None
+    without calling the model at all — the camera outranks the glasses.
+    """
+    if verdict is not None and verdict.get("passed"):
+        return None
+    if frame is None:
+        return None
+
+    url = _encode_frame(frame) if VISION else None
+    if url is None:
+        # No usable image means no observation. Inventing a correction from
+        # nothing would be worse than staying quiet.
+        print("[reason] no usable glasses frame; no correction offered")
+        return None
+
+    if memories is None:
+        try:
+            import memory
+            memories = memory.for_prompt(task, surface)
+        except Exception:                                   # noqa: BLE001
+            memories = "(memory unavailable)"
+
+    content: List[Dict] = [
+        {"type": "text", "text": f"""TASK THE ARM IS ATTEMPTING: {task}
+
+RELEVANT PAST FAILURES:
+{memories}
+
+This is the current view through the glasses. Is anything visibly wrong?"""},
+        {"type": "image_url", "image_url": {"url": url}},
+    ]
+
+    raw = _complete(OBSERVE_SYSTEM, content)
+    if raw is None:
+        # No model: stay silent. Unlike diagnose(), there is no camera
+        # measurement here to build a geometric fallback from, and guessing
+        # a correction from no evidence would be fabrication.
+        return None
+    if not raw.get("needs_correction", True):
+        return None
+    return {**raw, "source": "glasses"}
 
 
 def to_prompt_update(result: Optional[Dict]) -> Optional[Dict]:
