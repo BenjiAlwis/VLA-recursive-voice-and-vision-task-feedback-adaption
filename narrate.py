@@ -17,7 +17,10 @@ import threading
 import time
 from typing import Optional
 
-import cv2
+# cv2 is imported lazily inside _wait_for_photo. It is only needed to decode
+# a help photo, but at module scope it made `import narrate` — and therefore
+# ALL speech — fail on any machine without OpenCV. Speech is the highest
+# impact-per-minute feature in the build; it must not depend on the camera.
 
 HELP_DIR = os.getenv("HELP_DIR", "help_frames")
 BACKEND = os.getenv("TTS_BACKEND", "auto")     # auto | say | pyttsx3 | print
@@ -101,6 +104,8 @@ def request_help(reason: str, timeout_s: int = 45) -> Optional["cv2.Mat"]:
 
 
 def _wait_for_photo(timeout_s: int):
+    import cv2
+
     os.makedirs(HELP_DIR, exist_ok=True)
     before = set(glob.glob(f"{HELP_DIR}/*"))
     deadline = time.time() + timeout_s
