@@ -179,8 +179,11 @@ def request_help(reason: str, timeout_s: int = 45):
 
     if ESCALATE == "glasses":
         try:
-            from glasses_source import capture_frame
-            return capture_frame(timeout_s)
+            import glasses
+            frame = glasses.capture_frame(timeout_s)
+            if frame is not None:
+                return frame
+            print("[escalate] glasses returned no frame; using phone")
         except Exception as e:                              # noqa: BLE001
             print(f"[escalate] glasses unavailable, using phone: {e}")
 

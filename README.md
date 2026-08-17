@@ -1,30 +1,61 @@
-# The Dog That Knows It Failed
+# The Arm That Knows It Failed
 
-A quadruped that attempts a task, measures its own failure, says out loud
-what went wrong, and retries — accumulating reusable skills and a failure
-memory that transfers to the next task.
+A robot arm tries to pick up a block and place it in a zone. It misses,
+**measures its own failure with a camera**, says out loud why it went
+wrong, and retries — getting better each attempt. It remembers what it
+learned and reuses it. After repeated failures it asks a human for help
+through Meta Ray-Ban glasses, and if that is not enough, the human
+physically demonstrates the motion on a leader arm and the robot saves it
+as a new skill.
 
-**Perception** ArUco geometry + Go2 front camera →
+**Perception** ArUco geometry + wrist camera →
 **Reasoning** Nebius VLM planner + critic →
-**Action** SportClient primitives →
-**Feedback** failure memory → back into the planner.
+**Action** SO-101 named poses →
+**Feedback** failure memory + human voice → back into the planner.
 
 ---
 
-## Quick start (Team B, right now)
+## Quick start
 
 ```bash
-pip install openai opencv-python numpy pyttsx3 matplotlib
-export NEBIUS_API_KEY=...          # DO THIS FIRST. Verify it works.
-export ROBOT_BACKEND=temp          # fake robot until Team A ships mock
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
-python planner.py                  # standalone smoke test — Rikin
-python loop.py --no-llm            # harness runs with zero AI — Benji
-python narrate.py                  # TTS check — Aaryan
+# The milestone. Zero AI, zero hardware, proves the whole loop's mechanics.
+.venv/bin/python loop.py --no-llm
+
+# The loop actually learning, still with no API key and no hardware.
+.venv/bin/python loop.py --reflex --rounds 5 --perturb-at 3
+
+# The full system.
+export NEBIUS_API_KEY=...
+.venv/bin/python planner.py --verify        # DO THIS FIRST. See §Risks.
+.venv/bin/python loop.py --rounds 3 --voice
 ```
 
-`loop.py --no-llm` completing 5 trials **is the milestone.** Everything
-after is swapping stubs for real parts.
+Every module runs standalone as its own smoke test — `python critic.py`,
+`python vision.py`, and so on. Nine of them, all passing, all offline.
+
+---
+
+## The two non-negotiable rules
+
+**1. The LLM emits JSON from a fixed menu. Never code.**
+It picks from `move_to` / `grip` / `replay_skill` over five named poses.
+Invalid JSON → one retry with the validation error fed back → fixed
+fallback. `schema.py` rejects unknown actions, invented poses, offsets
+outside ±15cm, and skills that were never taught.
+
+**2. The camera decides pass/fail. The model only decides *why*.**
+`critic.geometric_verdict()` is the one function that no model call may
+influence. A VLM asked "did it succeed?" sometimes says yes when it
+failed — that stops the learning loop and looks broken on stage. The merge
+in `critique()` spreads the geometric verdict **last**, so a model that
+returns `passed: true` cannot override the camera. There is a test for
+exactly that.
+
+Every VLM/heuristic disagreement is appended to
+`logs/critic_disagreements.jsonl` — that file is the **Toloka payload**.
+Ship 30–50 for human labels and report critic accuracy as a number.
 
 ---
 
@@ -32,105 +63,153 @@ after is swapping stubs for real parts.
 
 | File | Owner | What it is |
 |---|---|---|
-| `robot_api.py` | Benji (contract) / Team A (impls) | **FROZEN.** 5 methods. The only surface between teams. |
-| `schema.py` | Benji | Skill library + strict JSON validator |
-| `loop.py` | Benji | The harness. Plan → execute → critique → remember |
-| `planner.py` | Rikin | Nebius call, prompt, JSON extraction, fallback |
-| `critic.py` | Rikin + Benji | Hybrid verdict: geometry passes/fails, VLM diagnoses |
-| `memory.py` | Aaryan | Failure store, keyword retrieval, ablation wipe |
-| `narrate.py` | Aaryan | TTS + human escalation (phone photo / glasses) |
-| `chart.py` | Aaryan → Team A | The evidence slide |
-| `mock_robot.py` | **Team A** | MockSportClient with slip + ArUco pose |
-| `go2_robot.py` | **Team A** | Real Go2 via go2-webrtc or SportClient |
+| `arm_api.py` | Benji | **THE CONTRACT.** 7 methods, `MockArm` + `SO101Arm`. |
+| `vision.py` | Benji | ArUco ground truth in cm. The critic's only input. |
+| `loop.py` | Benji | The harness. Sole writer of `shared/red_to_blue.json`. |
+| `schema.py` | Rikin | Action menu + validator + the fixed fallback. |
+| `planner.py` | Rikin | Nebius call, prompt, retry-with-error, reflex arm. |
+| `critic.py` | Rikin + Benji | Geometry passes/fails; VLM diagnoses. |
+| `memory.py` | Aaryan | Failure store, keyword retrieval, ablation wipe. |
+| `narrate.py` | Aaryan | TTS routed to the glasses via `say -a`. |
+| `voice.py` | Aaryan | Speech in, with a terminating fallback chain. |
+| `glasses.py` | Aaryan | Human interface. Audio core, video gated off. |
+| `teach.py` | Aaryan | Leader-arm demonstration recorder. Records only. |
+| `chart.py` | Aaryan | The evidence slide. |
+
+**Integrator:** Benji. Only person merging to `main` after T+0:30.
 
 ---
 
-## The two non-negotiable design rules
+## How it actually learns
 
-**1. The LLM never emits code.** It emits JSON matching `schema.PRIMITIVES`.
-Invalid JSON → one retry → geometric fallback. The demo never crashes
-because a model got creative.
+The mock arm has a **constant perception bias** — it believes the block is
+~5cm from where it truly is, against a 3cm grasp tolerance. So the naive
+plan misses 300/300 times, and the corrected plan succeeds 300/300. That
+separation is deliberate: random noise would teach nothing and would make
+the ablation chart flap.
 
-**2. Geometry decides pass/fail. The VLM only decides *why*.**
-A VLM asked "did it succeed?" will sometimes say yes when it failed. That
-stops the learning loop and the robot looks broken on stage. Never add a
-code path where the model returns a boolean.
+The loop closes like this:
 
-Disagreements between VLM diagnosis and heuristic diagnosis are appended to
-`logs/critic_disagreements.jsonl` — that file is the **Toloka payload**.
-Ship 30–50 of them for human labels, report critic accuracy as a number.
+1. Gripper closes 4.1cm right and 2.9cm short of the block. **Measured**,
+   at the moment it closed — not where the arm parked afterwards.
+2. `critic` writes that as a sentence *and* as `dx_cm=-4.1 dy_cm=+2.9`.
+3. `memory` stores it. Next attempt, retrieval hands it to the planner.
+4. The planner applies the offset. It succeeds.
 
----
-
-## Team A: what you must implement
-
-```python
-# mock_robot.py
-class MockSportClient(RobotBase):
-    """Same 5 methods. Inject slip ~0.75 and turn drift ~2°.
-    get_pose() should read ArUco when the camera sees markers,
-    and fall back to dead reckoning when it doesn't."""
-
-# go2_robot.py
-class Go2Robot(RobotBase):
-    """Go2 Move() is a VELOCITY command that persists until replaced.
-    forward(m) = Move(v,0,0); sleep(m/v); Move(0,0,0)
-    ALWAYS send the stop. Add a 2s watchdog that zeroes velocity."""
-```
-
-Then Team B changes nothing but `ROBOT_BACKEND=go2`.
+Corrections **compound** rather than reset — the measured error is a
+residual on top of whatever offset was already applied, so the stored value
+is `applied - residual`. Storing the raw residual makes the arm oscillate.
 
 ---
 
-## Evidence runs (do these before the freeze)
+## Evidence — four arms, one of them adversarial to our own claim
 
 ```bash
-python loop.py --wipe-memory --no-llm    --run-id baseline    # no learning
-python loop.py --wipe-memory --no-memory --run-id llm_nomem   # LLM, no memory
-python loop.py --wipe-memory             --run-id full        # everything
-python chart.py
+python loop.py --evidence        # runs all four, then charts them
 ```
 
-If `full` doesn't beat `baseline`, put that on the slide honestly. A team
-that reports "the LLM added interpretability but no accuracy over geometric
-regression" reads as serious. Nobody else will do it.
+| arm | what it isolates |
+|---|---|
+| `baseline` | fixed plan, no memory, no model. Must never improve. |
+| `reflex_mem` | memory + arithmetic, **no model**. |
+| `llm_nomem` | model, no memory. |
+| `full` | the system as pitched. |
+
+`reflex_mem` exists to attack our own headline. "Our robot learns from
+failure" is much weaker if a regex over the same measurements learns just
+as fast — so we measure it instead of hoping nobody asks. **If `full` does
+not beat `reflex_mem`, that goes on the slide.** `chart.py` prints the
+comparison in plain language and will say so itself.
+
+It also refuses to let a keyless run be mistaken for a result: if an arm
+labelled "model" never actually reached Nebius, the chart says so.
 
 ---
 
-## Gates — write these on the whiteboard now
+## Demo (90 seconds)
+
+```bash
+python loop.py --rounds 5 --perturb-at 3 --voice
+```
+
+1. Round 1: it misses, **says why out loud**, corrects, succeeds.
+2. Round 2: one attempt. It reused what it learned.
+3. Round 3: **someone bumps the camera.** Its learned correction is now
+   wrong. It fails, re-diagnoses, re-converges.
+4. Two failures in a row → it asks aloud → a human shows it on the leader
+   arm → it replays the demonstration and succeeds.
+5. `logs/evidence.png`.
+
+Step 3 is what they remember. Step 5 is why they believe it.
+
+Use `--perturb-kind calibration` (the default), not `zone`. Moving the
+zone is absorbed silently — the arm re-reads it from the overhead camera
+every trial, so nothing visibly happens.
+
+---
+
+## Gates — decide these now, while everyone is calm
 
 | When | Check | If it fails |
 |---|---|---|
-| T−1:00 | Glasses streaming a frame into Python? | **Cut.** `ESCALATE_BACKEND=phone` |
-| T+0:30 | Go2 standing from our code? | **Demo the mock.** Still a real system |
-| T+1:30 | — | **HARD FREEZE.** Record backup video. Rehearse only |
+| T−1:00 | `python glasses.py` — video streaming? | **Cut it.** Audio is the core path; video is off by default and every caller already handles `None`. |
+| T+0:30 | Arm moving from our code? | **Demo the mock.** Still a real system, teaching included. |
+| T+1:30 | — | **HARD FREEZE.** Record a backup video. Rehearse only. |
 
-**Integrator:** Benji. Only person pushing to `main` after T+0:30.
-**Safety:** one person on the remote, thumb on damp, that is their only job.
-3m taped perimeter, nobody inside it while the robot moves.
+The mock backend is never deleted, even after the real arm works.
+
+**Safety:** emergency stop is unplugging the USB. One person owns that and
+nothing else during any powered replay. Hands clear when powered.
 
 ---
 
-## Demo script (90 seconds)
+## Bringing up the real arm
 
-1. Task 1. It fails. **It says why out loud.** It retries. It succeeds.
-2. Task 2. Fewer attempts — it reuses a skill learned in Task 1.
-3. **Someone throws a towel across the floor mid-run.** It fails, notices
-   the physics changed, adapts.
-4. Show `logs/evidence.png`: trials-to-success, with and without memory.
+```bash
+export FOLLOWER_PORT=/dev/tty.usbmodem1101
+python arm_api.py --calibrate     # ~20 min, MANDATORY, do it first
+export ROBOT_BACKEND=so101
+```
 
-Step 3 is what they'll remember. Step 4 is what makes it defensible.
+Calibration records the five named poses plus a cm→joint offset model.
+`SO101Arm` refuses to move without it — an uncalibrated arm swinging to a
+hardcoded joint angle is how you break a servo. Every `send_action` carries
+one reconnect retry, because the follower drops mid-session.
+
+Then Team B changes nothing but `ROBOT_BACKEND`.
+
+---
+
+## Known risks
+
+- **The Nebius model id is unverified.** `python planner.py --verify`
+  before the first live call. A wrong id fails in a way that looks exactly
+  like an auth error and eats 20 minutes.
+- **`SO101Arm` and `teach.py --source leader` are untested against
+  hardware.** lerobot is not installed in this tree and its module paths
+  move between releases; both try several import paths and fail loudly.
+- **The mock's `set_joints` uses a crude linear map, not real forward
+  kinematics.** It exists so replayed demonstrations visibly work in mock
+  mode. Labelled as such in the code.
+- **Meta video needs a native app bridge.** Off by default; treat as a
+  stretch goal, never the critical path.
 
 ---
 
 ## Env vars
 
 ```
-NEBIUS_API_KEY      required
-NEBIUS_MODEL        default Qwen/Qwen2.5-VL-72B-Instruct — VERIFY THIS
+NEBIUS_API_KEY      required for the model arms
+NEBIUS_MODEL        default Qwen/Qwen2.5-VL-72B-Instruct — VERIFY IT
 NEBIUS_VISION       1|0    send frames to the planner
-ROBOT_BACKEND       temp|mock|go2
-SUCCESS_CM          12     pass threshold
-ESCALATE_BACKEND    phone|glasses|off
-HELP_DIR            help_frames/   drop a photo here to help the robot
+ROBOT_BACKEND       mock|so101
+FOLLOWER_PORT       serial port of the follower arm
+LEADER_PORT         serial port of the leader arm (teaching)
+SUCCESS_CM          5.0    pass threshold
+GRASP_TOL_CM        3.0    how close the gripper must be
+TEACH_AFTER         2      consecutive failures before escalating
+MOCK_REALTIME       1|0    0 strips the mock's sleeps (fast sweeps)
+GLASSES_VIDEO       0|1    the gated Meta video path
+OVERHEAD_CAM        0      ArUco ground-truth camera index
+WRIST_CAM           1      planner context camera index
 ```

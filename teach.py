@@ -441,8 +441,19 @@ def _write_skill(name: str, skill: Dict) -> bool:
 
 # ---------------- standalone smoke test ----------------
 
+def _shared_state():
+    """(exists, size, mtime) of the Red->Blue file, for the no-write check."""
+    path = "shared/red_to_blue.json"
+    if not os.path.exists(path):
+        return (False, None, None)
+    st = os.stat(path)
+    return (True, st.st_size, st.st_mtime)
+
+
 if __name__ == "__main__":
     import argparse
+
+    _SHARED_BEFORE = _shared_state()
 
     ap = argparse.ArgumentParser(description="record a demonstration")
     ap.add_argument("--name", default="smoke_demo")
@@ -527,6 +538,14 @@ if __name__ == "__main__":
     take_pending_replay()
 
     # The whole point of the refactor: this file writes nothing to shared/.
-    assert not os.path.exists("shared/red_to_blue.json"), \
-        "teach.py must not write the Red->Blue file — that is Benji's writer"
-    print("\nteach smoke test passed (wrote nothing to shared/)")
+    #
+    # Checked as "unchanged since this test started", not as "absent".
+    # Absence is the wrong test — loop.py is the legitimate writer of that
+    # file, so after any normal run it exists, and a bare exists() check
+    # then fails here and reads as "teach.py is broken" when nothing is
+    # wrong at all.
+    _after = _shared_state()
+    assert _after == _SHARED_BEFORE, (
+        f"teach.py must not touch the Red->Blue file — that is Benji's "
+        f"writer. Was {_SHARED_BEFORE}, now {_after}")
+    print("\nteach smoke test passed (left shared/ untouched)")

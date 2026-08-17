@@ -1,6 +1,21 @@
-openai>=1.30
-opencv-python
+# Core — the loop does not run without these.
+openai>=1.30          # Nebius AI Studio is OpenAI-compatible
+opencv-python         # ArUco ground truth, frame encoding
 numpy
-pyttsx3
+matplotlib            # the evidence chart
+
+# Voice in. Optional: without it, voice.py falls back to typed input and
+# the loop still runs end to end.
 sounddevice
-matplotlib
+
+# Speech out. macOS uses the built-in `say` (which is also the only way to
+# route audio to the glasses without changing the system default), so
+# pyttsx3 is only the non-Mac fallback.
+pyttsx3
+
+# NOT listed on purpose:
+#   lerobot          install per its own instructions; only needed for the
+#                    real SO-101, and its deps are heavy enough to break a
+#                    working laptop an hour before demo.
+#   openai-whisper   local transcription fallback. Large download. Add it
+#                    only if the venue wifi is untrustworthy.

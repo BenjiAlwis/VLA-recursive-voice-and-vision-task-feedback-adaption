@@ -12,6 +12,9 @@ logs/
 # Photos dropped in by a human during escalation.
 help_frames/
 
+# Frames pushed from the Meta Ray-Ban bridge (glasses.py, gated stretch goal).
+glasses_frames/
+
 # The Red <-> Blue IPC channel. The DIRECTORY is committed (via
 # shared/.gitkeep) so it exists on a fresh clone and neither team has to
 # guess why their writes vanish. The runtime messages inside it are not
