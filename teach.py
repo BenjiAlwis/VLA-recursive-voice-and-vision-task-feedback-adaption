@@ -16,7 +16,28 @@ Wire them in at the escalation branch — where narrate.request_help()
 is called today, call record_demonstration() instead when
 ESCALATE_BACKEND=teach.
 
-TWO NOTES FOR THE INTEGRATOR
+BENJI — TWO CHANGES NEEDED IN YOUR FILES TO MAKE REPLAY REACHABLE
+
+record_demonstration() already registers the taught skill via
+schema.add_skill(), so its name shows up in skills_for_prompt() and the
+planner can see it exists. But the planner may only emit PRIMITIVES, and
+there is no primitive that replays one. Two edits close that:
+
+  schema.py — add the primitive:
+      "replay_skill": {"name": (str, None, None)}
+    NOTE: validate_step unpacks every spec as (type, lo, hi) and then
+    does `lo <= val <= hi`, which blows up on a str param. It needs a
+    skip when lo/hi are None. This is the only reason it is your change
+    and not mine.
+
+  loop.py — add the execute() branch:
+      elif action == "replay_skill":
+          teach.replay_skill(params["name"])
+
+Until both land, demonstrations record and save correctly but nothing
+ever plays them back.
+
+TWO MORE NOTES FOR THE INTEGRATOR
   1. This needs the leader AND the follower at the same time, which the
      original single-arm contract couldn't express. Agreed extension:
      arm_api.get_arm(role="leader"|"follower"), role defaulting to
@@ -70,20 +91,44 @@ MAX_REL_TARGET = float(os.getenv("ARM_MAX_REL_TARGET", "10.0"))
 # joints that barely moved, which is precisely the wrong thing to weight.
 JOINT_SCALE = 100.0
 
-# Pose to park in on every exit path. VERIFY THESE AFTER CALIBRATION —
-# joint values are meaningless on an uncalibrated arm.
-SAFE_POSE = {
-    "shoulder_pan.pos": 0.0,
-    "shoulder_lift.pos": 0.0,
-    "elbow_flex.pos": 0.0,
-    "wrist_flex.pos": 0.0,
-    "wrist_roll.pos": 0.0,
-    "gripper.pos": 0.0,          # open — never park clamped on the block
-}
+# Where to leave the arm on every exit path.
+#
+# The default is deliberately NOT a hardcoded joint vector. On an
+# uncalibrated SO-101 all-zeros is not a rest pose — it is roughly fully
+# extended — so gliding there would sweep straight through the workspace
+# where the block and the human's hands are. Holding the current measured
+# position is the only pose that is safe without knowing the calibration.
+#
+# The gripper is left ALONE for the same reason: forcing it open at the
+# end of record_demonstration would drop the block the arm was just
+# taught to hold.
+#
+# After calibration, set a real rest pose to park in via either:
+#   ARM_SAFE_POSE='{"shoulder_pan.pos": 0.0, ...}'   (env, JSON)
+#   logs/safe_pose.json                              (file, JSON)
+SAFE_POSE_FILE = "logs/safe_pose.json"
+
+
+def _safe_pose_override() -> Optional[Dict[str, float]]:
+    """A calibrated rest pose, if anyone has supplied one. Else None."""
+    raw = os.getenv("ARM_SAFE_POSE")
+    try:
+        if raw:
+            return json.loads(raw)
+        if os.path.exists(SAFE_POSE_FILE):
+            with open(SAFE_POSE_FILE) as f:
+                return json.load(f)
+    except Exception as e:                                  # noqa: BLE001
+        print(f"[teach] ignoring unreadable safe pose: {e}")
+    return None
 
 # Populated by replay_skill so callers (and the smoke test) can assert on
 # what actually went over the wire.
 LAST_REPLAY_STATS: Dict[str, float] = {}
+
+# Total successful set_joints calls, counted in _send so that approach
+# moves are included too — not just the waypoint-to-waypoint steps.
+_SENT = 0
 
 
 # ---------------- transport ----------------
@@ -95,8 +140,10 @@ def _send(arm, joints: Dict[str, float]) -> bool:
     not an exceptional case. One reconnect, one retry, then give up
     quietly — a dropped frame at 30Hz is invisible, a crash is not.
     """
+    global _SENT
     try:
         arm.set_joints(joints)
+        _SENT += 1
         return True
     except Exception as first:                              # noqa: BLE001
         try:
@@ -106,6 +153,7 @@ def _send(arm, joints: Dict[str, float]) -> bool:
             else:
                 arm.connect()
             arm.set_joints(joints)
+            _SENT += 1
             return True
         except Exception as second:                         # noqa: BLE001
             print(f"[teach] send failed after reconnect: {first} / {second}")
@@ -136,6 +184,16 @@ def _steps_needed(a: Dict[str, float], b: Dict[str, float]) -> int:
     Derived from the largest per-joint jump, not a fixed count: a fixed
     5-step interpolation between two distant waypoints still violates the
     limit, which is the bug this function exists to prevent.
+
+    VERIFY AT BRING-UP: this guarantees a bound on the delta between
+    consecutive COMMANDED frames. Check what LeRobot's
+    ensure_safe_goal_position actually clamps against — if it clamps
+    against the present MEASURED position, a servo lagging behind the
+    command stream can sit >MAX_REL_TARGET from the next command even
+    when consecutive commands are well inside it, and LeRobot will clamp
+    and silently under-travel. If so, interpolate from _read(follower)
+    each step instead of from the previous commanded frame. The mock
+    cannot catch this — it applies commands instantly with no lag.
     """
     biggest = max((abs(b[k] - a.get(k, b[k])) for k in b), default=0.0)
     return max(1, math.ceil(biggest / MAX_REL_TARGET))
@@ -165,9 +223,31 @@ def _glide(arm, goal: Dict[str, float], duration: float = 1.0) -> float:
 def _park(arm) -> None:
     """Leave the arm safe. Called from `finally`, so it must not raise."""
     try:
-        _glide(arm, SAFE_POSE, duration=1.2)
+        override = _safe_pose_override()
+        if override:
+            _glide(arm, override, duration=1.2)
+            return
+        # No calibrated rest pose known: hold exactly where we are. Commanding
+        # the measured position stops motion without inventing coordinates.
+        here = _read(arm)
+        if here:
+            _send(arm, here)
     except Exception as e:                                  # noqa: BLE001
         print(f"[teach] could not reach safe pose: {e}")
+
+
+def _release(arm) -> None:
+    """Close the serial connection. Leaving the port open means the NEXT
+    run cannot connect, which on demo day looks like broken hardware."""
+    try:
+        for name in ("disconnect", "close", "__exit__"):
+            fn = getattr(arm, name, None)
+            if fn is None:
+                continue
+            fn(None, None, None) if name == "__exit__" else fn()
+            return
+    except Exception as e:                                  # noqa: BLE001
+        print(f"[teach] could not release arm cleanly: {e}")
 
 
 # ---------------- waypoint selection ----------------
@@ -285,6 +365,7 @@ def record_demonstration(name: str, seconds: int = 10,
             "waypoints": waypoints,
         }
         _write_demo(name, skill)
+        _register(name, task)
         _say("Got it. Let me try that.")
         return skill
 
@@ -294,6 +375,9 @@ def record_demonstration(name: str, seconds: int = 10,
     finally:
         if follower is not None:
             _park(follower)
+            _release(follower)
+        if leader is not None:
+            _release(leader)
 
 
 def replay_skill(name: str, speed: float = 1.0) -> bool:
@@ -311,7 +395,7 @@ def replay_skill(name: str, speed: float = 1.0) -> bool:
 
     follower = None
     worst = 0.0
-    messages = 0
+    sent_before = _SENT
     try:
         follower = get_arm(role="follower")
         speed = max(0.1, float(speed))
@@ -332,13 +416,13 @@ def replay_skill(name: str, speed: float = 1.0) -> bool:
                 worst = max(worst, max(abs(frame[k] - ref.get(k, frame[k]))
                                        for k in frame))
                 _send(follower, frame)
-                messages += 1
                 last = frame
                 if dt:
                     time.sleep(dt)
 
         LAST_REPLAY_STATS.update(
-            {"max_step_delta": round(worst, 4), "messages": messages,
+            {"max_step_delta": round(worst, 4),
+             "messages": _SENT - sent_before,
              "limit": MAX_REL_TARGET})
         return True
 
@@ -348,6 +432,7 @@ def replay_skill(name: str, speed: float = 1.0) -> bool:
     finally:
         if follower is not None:
             _park(follower)
+            _release(follower)
 
 
 def list_skills() -> List[str]:
@@ -361,6 +446,31 @@ def list_skills() -> List[str]:
 def _demo_path(name: str) -> str:
     safe = "".join(c for c in name if c.isalnum() or c in "._-") or "unnamed"
     return f"{DEMO_DIR}/{safe}.json"
+
+
+def _register(name: str, task: str) -> bool:
+    """Announce the taught skill to Benji's skill library.
+
+    Without this the demo is unreachable: the planner only ever sees
+    schema.skills_for_prompt(), which reads logs/skills.json, so a file
+    sitting in logs/demos/ might as well not exist. Registering an entry
+    with composed_of=[] validates trivially and puts the name in front of
+    the model. Uses schema's public API — schema.py itself is untouched.
+
+    Best-effort by design: a skill library hiccup must not lose a
+    demonstration we already have safely on disk.
+    """
+    try:
+        import schema
+        return schema.add_skill({
+            "name": name,
+            "params": {"name": name},
+            "composed_of": [],
+            "learned_from": f"demonstration/{task}",
+        })
+    except Exception as e:                                  # noqa: BLE001
+        print(f"[teach] could not register '{name}' in the skill library: {e}")
+        return False
 
 
 def _write_demo(name: str, skill: Dict) -> None:
