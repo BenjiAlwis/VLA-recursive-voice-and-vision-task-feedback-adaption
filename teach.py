@@ -9,24 +9,30 @@ waypoints that matter, and save it as a named skill.
 
 Red never commands a motor. This file only ever:
   - READS joint states (lerobot get_observation, or a fabricated mock)
-  - WRITES JSON to logs/skills/ and shared/red_to_blue.json
+  - WRITES JSON to logs/skills/ only
 
 It does NOT mirror the leader to the follower, does NOT replay, does NOT
-call send_action. Mirroring and replay are BLUE actions. We ask for a
-replay by writing `replay_skill` into the Red->Blue message and Blue
-decides when to run it.
+call send_action. Mirroring and replay belong to the BLUE team (a separate
+team running the simulation and the arm); we only ask for them.
 
-An earlier version of this file did drive the follower. That was removed
-deliberately — if you are reintroducing a write path to any arm here,
-you are crossing the team boundary.
+It also does NOT write shared/red_to_blue.json. Benji's red loop owns the
+"emit prompt update" step and is the single writer of that file. Two
+writers would each need merge logic to avoid clobbering the other's
+prompt_update; one writer needs none. We queue a request and the harness
+emits it.
+
+An earlier version of this file drove the follower AND wrote the shared
+file. Both were removed deliberately — if you are reintroducing a write
+path to an arm or to red_to_blue.json here, you are crossing a boundary.
 
     import teach
-    teach.record_demonstration("pick_block", seconds=10, source="mock")
-    teach.list_skills()
-    teach.request_replay("pick_block")
+    skill = teach.record_demonstration("pick_block", seconds=10)
+    teach.request_replay("pick_block")     # queues, does not write
 
-Benji: call record_demonstration() at the escalation branch, then
-request_replay() to hand it to Blue. I never touch the shared loop.
+Benji, in the red loop:
+    pending = teach.take_pending_replay()  # consume-once
+    if pending:
+        msg.update(pending)                # your writer emits it
 """
 import glob
 import json
@@ -50,8 +56,10 @@ except Exception as _e:                                     # noqa: BLE001
 
 
 SKILL_DIR = "logs/skills"
-SHARED_DIR = os.getenv("SHARED_DIR", "shared")
-RED_TO_BLUE = os.path.join(SHARED_DIR, "red_to_blue.json")
+
+# A replay request waiting for the harness to emit it. This file never
+# writes shared/red_to_blue.json — Benji's red loop owns that write.
+_pending_replay: Optional[Dict] = None
 
 HZ = float(os.getenv("TEACH_HZ", "30"))
 WAYPOINTS = int(os.getenv("TEACH_WAYPOINTS", "20"))
@@ -336,21 +344,61 @@ def load_skill(name: str) -> Optional[Dict]:
         return None
 
 
-def request_replay(name: str, reason: str = "", confidence: float = 0.8) -> bool:
-    """Ask BLUE to replay a taught skill. We never replay it ourselves.
+def request_replay(name: str, reason: str = "",
+                   confidence: Optional[float] = None) -> Optional[Dict]:
+    """Register a request for Blue to replay a taught skill.
 
-    Read-modify-write, because `replay_skill` is one field of a message
-    Red also uses for prompt_update/reason/confidence. Writing a fresh
-    object here would wipe whatever directive Reasoning last published.
+    Does NOT touch shared/red_to_blue.json. Benji's harness owns the emit
+    step and is the single writer of that file; two writers would each need
+    merge logic to avoid clobbering the other's prompt_update, and one
+    writer needs none.
+
+    Returns the fields to merge into the Red->Blue message, or None if the
+    skill does not exist. The request is also queued for
+    take_pending_replay() so a polling loop can pick it up without holding
+    the return value.
+
+    The payload carries ONLY replay_skill unless you explicitly pass reason
+    or confidence. `reason` and `confidence` are shared fields that
+    Reasoning also sets, and merging our defaults over them would silently
+    replace Rikin's explanation of his own prompt_update with boilerplate
+    about a replay.
     """
+    global _pending_replay
+
     if load_skill(name) is None:
         print(f"[teach] refusing to request replay of unknown skill {name!r}")
-        return False
-    return _update_red_to_blue({
-        "replay_skill": name,
-        "reason": reason or f"replaying taught skill '{name}'",
-        "confidence": float(confidence),
-    })
+        return None
+
+    payload: Dict = {"replay_skill": name}
+    if reason:
+        payload["reason"] = reason
+    if confidence is not None:
+        payload["confidence"] = float(confidence)
+    _pending_replay = dict(payload)
+    print(f"[teach] replay requested: {name!r} (awaiting the harness)")
+    return payload
+
+
+def take_pending_replay() -> Optional[Dict]:
+    """Pop the queued replay request, or None if there isn't one.
+
+    For Benji: call this each tick of the red loop and merge the result into
+    the Red->Blue message. Consume-once, so a skill is not replayed forever
+    once it has been handed over.
+
+        pending = teach.take_pending_replay()
+        if pending:
+            msg.update(pending)
+    """
+    global _pending_replay
+    payload, _pending_replay = _pending_replay, None
+    return payload
+
+
+def peek_pending_replay() -> Optional[Dict]:
+    """The queued request without consuming it. For logging and tests."""
+    return dict(_pending_replay) if _pending_replay else None
 
 
 # ---------------- persistence ----------------
@@ -380,34 +428,6 @@ def _write_json_atomic(path: str, payload: Dict) -> bool:
     except Exception as e:                                  # noqa: BLE001
         print(f"[teach] could not write {path}: {e}")
         return False
-
-
-def _read_json_tolerant(path: str) -> Dict:
-    """Existing message, or {} if missing/corrupt/mid-write."""
-    try:
-        with open(path) as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except FileNotFoundError:
-        return {}
-    except Exception as e:                                  # noqa: BLE001
-        print(f"[teach] ignoring unreadable {path}: {e}")
-        return {}
-
-
-def _update_red_to_blue(fields: Dict) -> bool:
-    """Merge `fields` into the Red->Blue message, preserving the rest."""
-    msg = _read_json_tolerant(RED_TO_BLUE)
-    msg.setdefault("prompt_update", None)
-    msg.setdefault("reason", "")
-    msg.setdefault("confidence", 0.0)
-    msg.setdefault("replay_skill", None)
-    msg.update(fields)
-    msg["ts"] = time.time()
-    if _write_json_atomic(RED_TO_BLUE, msg):
-        print(f"[teach] -> blue: replay_skill={msg.get('replay_skill')!r}")
-        return True
-    return False
 
 
 def _write_skill(name: str, skill: Dict) -> bool:
@@ -469,12 +489,44 @@ if __name__ == "__main__":
           f"{load_skill(args.name)['waypoint_count']} waypoints")
     print(f"load_skill(missing):   {load_skill('nope__')}")
 
-    # Requesting replay must not clobber a directive Reasoning wrote.
-    _update_red_to_blue({"prompt_update": "move 2cm left before grasping",
-                         "reason": "previous attempt missed the grasp"})
-    print(f"request_replay:        {request_replay(args.name)}")
+    # Replay is queued for the harness, never written to the shared file.
+    payload = request_replay(args.name)
+    print(f"\nrequest_replay ->      {payload}")
     print(f"request_replay(bogus): {request_replay('nope__')}")
-    print("\nred_to_blue.json now:")
-    print(json.dumps(_read_json_tolerant(RED_TO_BLUE), indent=2))
-    if _read_json_tolerant(RED_TO_BLUE).get("prompt_update") is None:
-        sys.exit("FAIL: request_replay clobbered prompt_update")
+
+    assert payload and payload["replay_skill"] == args.name
+    assert request_replay("nope__") is None, "unknown skill must not queue"
+    assert peek_pending_replay() is not None, "request should be queued"
+
+    # This is the integration Benji wires: pop, merge, emit. Consume-once,
+    # so a skill is not replayed on every subsequent tick.
+    msg = {"prompt_update": "move 2cm left before grasping",
+           "reason": "previous attempt missed the grasp",
+           "confidence": 0.6, "replay_skill": None}
+    pending = take_pending_replay()
+    if pending:
+        msg.update(pending)
+    print("\nwhat Benji's writer would emit:")
+    print(json.dumps(msg, indent=2))
+
+    assert msg["replay_skill"] == args.name
+    assert msg["prompt_update"] == "move 2cm left before grasping", \
+        "merging must not drop the directive Reasoning wrote"
+    # Reasoning's own reason and confidence must survive the merge too.
+    assert msg["reason"] == "previous attempt missed the grasp", \
+        "merging must not overwrite Reasoning's reason"
+    assert msg["confidence"] == 0.6, \
+        "merging must not overwrite Reasoning's confidence"
+    assert take_pending_replay() is None, "consume-once failed"
+
+    # ...but an explicit reason IS allowed to be sent when the caller means it.
+    assert request_replay(args.name, reason="human taught it",
+                          confidence=0.9) == {
+        "replay_skill": args.name, "reason": "human taught it",
+        "confidence": 0.9}
+    take_pending_replay()
+
+    # The whole point of the refactor: this file writes nothing to shared/.
+    assert not os.path.exists("shared/red_to_blue.json"), \
+        "teach.py must not write the Red->Blue file — that is Benji's writer"
+    print("\nteach smoke test passed (wrote nothing to shared/)")
