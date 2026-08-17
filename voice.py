@@ -24,12 +24,13 @@ returns "" promptly instead of blocking forever.
 """
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
 import time
 import wave
-from typing import Optional
+from typing import Dict, List, Optional
 
 try:
     import narrate
@@ -78,6 +79,64 @@ def _have_whisper() -> bool:
         return False
 
 
+# ---------------- input device selection ----------------
+# narrate.py picks the OUTPUT device via `say -a`. This is the matching
+# half: without it, paired glasses would be selected as the system output
+# while recording still came from the laptop microphone — which sounds like
+# "the glasses mic doesn't work" and is actually just the wrong device.
+
+_input_device: Optional[int] = None
+
+
+def list_input_devices() -> List[Dict]:
+    """Microphones as [{"index", "name", "channels"}].
+
+    Needs sounddevice. Returns [] without it — callers must treat empty as
+    "use the default", not as an error.
+    """
+    try:
+        import sounddevice as sd
+        return [{"index": i, "name": d["name"],
+                 "channels": d["max_input_channels"]}
+                for i, d in enumerate(sd.query_devices())
+                if d.get("max_input_channels", 0) > 0]
+    except Exception as e:                                  # noqa: BLE001
+        print(f"[voice] cannot list input devices: {e}")
+        return []
+
+
+def set_input_device(name_substring: str) -> bool:
+    """Record from the first microphone whose name contains the substring.
+
+    Pass "Ray-Ban" or "Meta". Case- and punctuation-insensitive, because
+    macOS device names carry curly apostrophes. Returns False and leaves the
+    default in place if nothing matches — a missing headset must never stop
+    the run.
+    """
+    global _input_device
+
+    if not name_substring:
+        _input_device = None
+        print("[voice] input device reset to system default")
+        return True
+
+    def _norm(s: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", s.lower())
+
+    want = _norm(name_substring)
+    devices = list_input_devices()
+    for dev in devices:
+        if want in _norm(dev["name"]):
+            _input_device = dev["index"]
+            print(f"[voice] recording from {dev['name']} "
+                  f"(index {dev['index']})")
+            return True
+
+    print(f"[voice] no microphone matching {name_substring!r}; staying on "
+          f"the default. Available: {[d['name'] for d in devices]}")
+    return False
+
+
 def capabilities() -> dict:
     """What this machine can actually do right now. Useful at bring-up:
     run `python voice.py` and see which layer you are on."""
@@ -92,11 +151,11 @@ def capabilities() -> dict:
 # ---------------- recording ----------------
 
 def _record_wav(max_s: float) -> Optional[str]:
-    """Record from the default input device until Enter or max_s.
+    """Record until Enter or max_s, then return a WAV path.
 
-    The default input is the glasses when they are paired — that is the
-    whole reason this takes no device argument. Returns a WAV path, or
-    None if anything at all goes wrong.
+    Records from whatever set_input_device() selected, or the system default
+    if nothing was selected — which is the glasses when they are paired AND
+    set as the default input. Returns None if anything at all goes wrong.
     """
     try:
         import numpy as np
@@ -126,7 +185,8 @@ def _record_wav(max_s: float) -> Optional[str]:
 
     try:
         with sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
-                            dtype="int16", callback=_cb):
+                            dtype="int16", callback=_cb,
+                            device=_input_device):
             deadline = time.monotonic() + max_s
             while not stop.is_set() and time.monotonic() < deadline:
                 time.sleep(0.05)
@@ -266,6 +326,17 @@ def listen_for_feedback(timeout_s: int = 8) -> str:
 if __name__ == "__main__":
     caps = capabilities()
     print("voice capabilities:", json.dumps(caps, indent=2))
+
+    mics = list_input_devices()
+    print("\ninput devices:")
+    for d in mics:
+        print(f"  [{d['index']:>2}] {d['name']}  ({d['channels']}ch)")
+    if not mics:
+        print("  (none listed — needs sounddevice; will use system default)")
+    # The glasses will not be paired during development. A miss must report
+    # and leave the default intact, not raise.
+    print(f"set_input_device('Ray-Ban') -> {set_input_device('Ray-Ban')}")
+    assert set_input_device("") is True, "reset to default must succeed"
 
     layer = ("mic + nebius" if caps["mic"] and caps["nebius"] else
              "mic + whisper" if caps["mic"] and caps["whisper"] else
