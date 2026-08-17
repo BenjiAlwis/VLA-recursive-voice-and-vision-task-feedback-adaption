@@ -402,6 +402,149 @@ def evidence_runs(args) -> None:
 
 # ---------------- entry ----------------
 
+# ---------------- self-test ----------------
+
+def self_test() -> None:
+    """Offline check of the harness's own logic.
+
+    Everything else in this repo self-tests; this file did not, which is
+    backwards — it is the integrator, it owns the two arithmetic bugs that
+    were hardest to see (the grasp latch and compounding corrections), and
+    it is the single writer of the file the other team reads.
+    """
+    import tempfile
+    import arm_api
+
+    print("=== _applied_offset reads the offset off at_block ===")
+    plan = schema.fallback_plan(dx_cm=-4.2, dy_cm=2.8)
+    assert _applied_offset(plan) == (-4.2, 2.8), _applied_offset(plan)
+    assert _applied_offset({"steps": []}) == (0.0, 0.0)
+    assert _applied_offset({"steps": [{"action": "grip",
+                                       "params": {"state": "close"}}]}) == (0.0, 0.0)
+    print("  ok")
+
+    print("\n=== corrections COMPOUND, they do not reset ===")
+    # Trial 1 applies nothing and measures the full bias as residual.
+    p1 = schema.fallback_plan()
+    n1 = _next_offset(p1, {"grasp_error_cm": (4.2, -2.8)})
+    assert n1 == (-4.2, 2.8), n1
+    # Trial 2 applies that, and a small residual REMAINS. The new offset
+    # must be the old one adjusted — not the residual on its own, which
+    # would throw away the correction and make the arm oscillate.
+    p2 = schema.fallback_plan(dx_cm=n1[0], dy_cm=n1[1])
+    n2 = _next_offset(p2, {"grasp_error_cm": (0.4, -0.3)})
+    assert n2 == (-4.6, 3.1), f"expected (-4.6, 3.1), got {n2}"
+    assert abs(n2[0]) > abs(n1[0]), "the correction must accumulate"
+    print(f"  trial1 -> {n1}   trial2 -> {n2}   (accumulated, not reset)")
+    assert _next_offset(p1, {"grasp_error_cm": None}) is None
+    assert _next_offset(p1, {}) is None
+    print("  ok")
+
+    print("\n=== the grasp offset is latched at CLOSE, not at rest ===")
+    arm = arm_api.MockArm()
+    for step in schema.fallback_plan()["steps"]:
+        pr = step["params"]
+        if step["action"] == "move_to":
+            arm.move_to(pr["pose"], pr["dx_cm"], pr["dy_cm"], pr["dz_cm"])
+        else:
+            arm.grip(pr["state"], pr.get("strength", 80))
+    scene = arm.get_scene()
+    verdict = critic.critique(arm.get_scene(), scene,
+                              schema.fallback_plan(), use_llm=False)
+    residual = verdict["grasp_error_cm"]
+    true_bias = arm_api.MockArm.PERCEPTION_BIAS
+    print(f"  measured {tuple(round(v, 1) for v in residual)}  "
+          f"true bias {true_bias}")
+    assert abs(residual[0] - true_bias[0]) < 1.0 and \
+           abs(residual[1] - true_bias[1]) < 1.0, \
+        ("the measured offset must match the real bias. If this fails, the "
+         "critic is reading the gripper's PARKED position again and every "
+         "correction will have the wrong sign.")
+    # And the correction it implies must actually solve the task.
+    nxt = _next_offset(schema.fallback_plan(), verdict)
+    arm2 = arm_api.MockArm()
+    before2 = arm2.get_scene()
+    fixed = schema.fallback_plan(dx_cm=nxt[0], dy_cm=nxt[1])
+    for step in fixed["steps"]:
+        pr = step["params"]
+        if step["action"] == "move_to":
+            arm2.move_to(pr["pose"], pr["dx_cm"], pr["dy_cm"], pr["dz_cm"])
+        else:
+            arm2.grip(pr["state"], pr.get("strength", 80))
+    v2 = critic.critique(before2, arm2.get_scene(), fixed, use_llm=False)
+    print(f"  applying {nxt} -> passed={v2['passed']} err={v2['error_cm']}cm")
+    assert v2["passed"], "the derived correction must actually solve the task"
+    print("  ok")
+
+    print("\n=== execute() drops invalid steps and runs the rest ===")
+    arm3 = arm_api.MockArm()
+    ran = execute(arm3, {"steps": [
+        {"action": "move_to", "params": {"pose": "above_block"}},
+        {"action": "forward", "params": {"meters": 1.0}},      # stale Go2
+        {"action": "move_to", "params": {"pose": "at_the_pub"}},  # invented
+        {"action": "grip", "params": {"state": "close"}},
+    ]})
+    assert ran == ["move_to", "grip"], ran
+    print(f"  ran {ran}, skipped 2 bad steps without raising")
+
+    print("\n=== emit_red_to_blue writes atomically and completely ===")
+    global SHARED_MSG
+    saved = SHARED_MSG
+    SHARED_MSG = os.path.join(tempfile.mkdtemp(), "red_to_blue.json")
+    payload = {"ts": 1.0, "trial": 1, "prompt_update": "move 2cm left",
+               "reason": "missed the grasp", "confidence": 0.6,
+               "replay_skill": None, "steps": []}
+    emit_red_to_blue(payload)
+    with open(SHARED_MSG) as f:
+        assert json.load(f) == payload, "round trip lost data"
+    leftovers = [p for p in os.listdir(os.path.dirname(SHARED_MSG))
+                 if p.endswith(".tmp")]
+    assert not leftovers, f"temp files left behind: {leftovers}"
+    print(f"  round-tripped, no .tmp left behind")
+
+    print("\n=== a queued replay merges without clobbering Reasoning ===")
+    # teach.py's contract: it queues, we merge and emit. Reasoning's own
+    # prompt_update / reason / confidence must survive the merge.
+    teach._pending_replay = {"replay_skill": "human_taught_grasp"}
+    msg = dict(payload)
+    pending = teach.take_pending_replay()
+    if pending:
+        msg.update(pending)
+    emit_red_to_blue(msg)
+    with open(SHARED_MSG) as f:
+        out = json.load(f)
+    assert out["replay_skill"] == "human_taught_grasp"
+    assert out["prompt_update"] == "move 2cm left", "merge dropped the directive"
+    assert out["reason"] == "missed the grasp", "merge overwrote the reason"
+    assert out["confidence"] == 0.6, "merge overwrote the confidence"
+    assert teach.take_pending_replay() is None, "consume-once failed"
+    SHARED_MSG = saved
+    print("  ok")
+
+    print("\n=== escalation stays silent when it cannot actually ask ===")
+    spoken = []
+    real_speak, narrate.speak = narrate.speak, lambda t, **k: spoken.append(t)
+    try:
+        got = escalate(arm_api.MockArm(), "task", {"failure_mode": "missed_grasp"},
+                       [], use_voice=False, allow_teaching=False)
+        assert got is None and not spoken, \
+            f"must not promise help it cannot deliver, said: {spoken}"
+        print("  --no-teaching + no voice -> silent")
+    finally:
+        narrate.speak = real_speak
+
+    print("\n=== a full run returns the documented shape ===")
+    memory.wipe()
+    result = run_task(arm_api.MockArm(), "pick up the red block", max_trials=3,
+                      use_llm=False, use_reflex=True, allow_teaching=False,
+                      run_id="selftest")
+    assert set(result) >= {"solved", "trials"}, result
+    assert result["solved"] and result["trials"] == 2, result
+    print(f"  {result}")
+
+    print("\nloop self-test passed")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--task",
@@ -432,8 +575,14 @@ def main():
                     help="calibration drift invalidates what it learned "
                          "(use this on stage); zone move it absorbs silently")
     ap.add_argument("--evidence", action="store_true",
-                    help="run all three ablations and build the chart")
+                    help="run all four ablation arms and build the chart")
+    ap.add_argument("--self-test", action="store_true",
+                    help="offline check of the harness's own logic")
     args = ap.parse_args()
+
+    if args.self_test:
+        self_test()
+        return
 
     if args.evidence:
         evidence_runs(args)
