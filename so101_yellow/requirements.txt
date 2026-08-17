@@ -1,0 +1,11 @@
+# Install with: pip install -r requirements.txt
+# or directly:  pip install 'lerobot[feetech,smolvla,core_scripts,training]'
+#
+# Requires Python >= 3.12.
+#
+# Extras used:
+#   feetech       - SO-101 uses Feetech STS3215 servos (not Dynamixel)
+#   core_scripts  - lerobot-record, lerobot-replay, lerobot-calibrate, lerobot-find-port, lerobot-find-cameras
+#   smolvla       - SmolVLA policy dependencies
+#   training      - lerobot-train, accelerate, wandb
+lerobot[feetech,smolvla,core_scripts,training]
