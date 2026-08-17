@@ -2,4 +2,5 @@ openai>=1.30
 opencv-python
 numpy
 pyttsx3
+sounddevice
 matplotlib
