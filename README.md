@@ -1,17 +1,60 @@
-# The Arm That Knows It Failed
+<div align="center">
+  <h1>The Arm That Knows It Failed</h1>
+</div>
 
-A robot arm tries to pick up a block and place it in a zone. It misses,
-**measures its own failure with a camera**, says out loud why it went
-wrong, and retries — getting better each attempt. It remembers what it
-learned and reuses it. After repeated failures it asks a human for help
-through Meta Ray-Ban glasses, and if that is not enough, the human
-physically demonstrates the motion on a leader arm and the robot saves it
-as a new skill.
+<div align="center">
+  <h3>A robot arm that fails at a task, says out loud why it failed, and
+  gets it right on the next attempt — no retraining, no teleoperation.</h3>
+</div>
 
-**Perception** ArUco geometry + wrist camera →
-**Reasoning** Nebius VLM planner + critic →
-**Action** SO-101 named poses →
-**Feedback** failure memory + human voice → back into the planner.
+<div align="center">
+  <img src="https://img.shields.io/badge/arm-SO--101-black" alt="Arm: SO-101">
+  <img src="https://img.shields.io/badge/platform-macOS-black" alt="Platform: macOS">
+  <img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="Python 3.11+">
+  <img src="https://img.shields.io/badge/inference-Nebius-6f42c1" alt="Inference: Nebius">
+  <img src="https://img.shields.io/badge/training-none-brightgreen" alt="No training">
+</div>
+
+<br>
+
+An SO-101 arm tries to pick up a block and place it in a target zone. A
+fixed camera measures what actually happened and decides pass or fail. On a
+failure a vision-language model explains *why* — "I closed my gripper two
+centimetres short of the block" — the arm speaks that diagnosis aloud, and
+the explanation is rewritten into a new instruction for the controller. The
+next attempt is a different attempt. Nothing is retrained; the improvement
+lives entirely in the prompt and in a memory of past failures.
+
+When it fails twice in a row it stops guessing and asks for help. A human
+moves the **leader** arm through the motion by hand, that trajectory is
+saved as a named skill, and the arm replays it.
+
+```
+camera  →  sensing  →  reasoning  →  prompt update  →  VLA  →  arm moves
+(fixed)   (pass/fail)  (why + fix)     (Red→Blue)     (Blue)      │
+                            ↑                                     │
+                         memory  ←──── failure recorded ←──────────┘
+                     (past failures shape the next prompt)
+
+    after 2 failures:  human moves the leader arm  →  skill saved  →  replayed
+```
+
+Two rules hold the whole thing up, and both are enforced in code rather
+than trusted:
+
+- **The camera decides pass/fail — the model only explains why.** A critic
+  that hallucinates success stops the learning loop and makes the arm look
+  broken on stage. `reason.diagnose()` refuses to run on a passing verdict,
+  strips any success-like key out of the model's reply, and returns a dict
+  with no pass/fail field at all.
+- **The model emits JSON only, against a fixed schema.** Non-JSON, an
+  unknown failure mode, an empty diagnosis, or a `prompt_update` containing
+  code is discarded and a geometry-only fallback is used instead. The
+  demo never depends on a model behaving.
+
+The self-improvement is measurable, not asserted: `memory.wipe()` is an
+ablation switch, so the same task can be run with and without memory and
+the trials-to-success compared.
 
 ---
 
@@ -68,15 +111,31 @@ Ship 30–50 for human labels and report critic accuracy as a number.
 | `loop.py` | Benji | The harness. Sole writer of `shared/red_to_blue.json`. |
 | `schema.py` | Rikin | Action menu + validator + the fixed fallback. |
 | `planner.py` | Rikin | Nebius call, prompt, retry-with-error, reflex arm. |
-| `critic.py` | Rikin + Benji | Geometry passes/fails; VLM diagnoses. |
+| `reason.py` | Rikin | VLM diagnosis → `prompt_update`. Strips verdict keys. |
+| `critic.py` | Rikin + Benji | Geometry passes/fails; delegates *why* to `reason`. |
 | `memory.py` | Aaryan | Failure store, keyword retrieval, ablation wipe. |
 | `narrate.py` | Aaryan | TTS routed to the glasses via `say -a`. |
 | `voice.py` | Aaryan | Speech in, with a terminating fallback chain. |
-| `glasses.py` | Aaryan | Human interface. Audio core, video gated off. |
+| `glasses.py` | Aaryan | Human interface — audio routing + photo ingest. |
+| `glasses_bridge.py` | Aaryan | Wearables SDK app side of the photo ingest. |
+| `supervise.py` | Aaryan | Interval glasses-correction loop. |
 | `teach.py` | Aaryan | Leader-arm demonstration recorder. Records only. |
 | `chart.py` | Aaryan | The evidence slide. |
+| `so101_yellow/` | Team Yellow | Real hardware bring-up: ports, motors, calibration. |
 
 **Integrator:** Benji. Only person merging to `main` after T+0:30.
+
+### Where the two reasoning paths meet
+
+`critic.py` and `reason.py` were written in parallel and both diagnose
+failures. They are **not** duplicates any more:
+
+- `critic.geometric_verdict()` — the camera. The sole pass/fail authority.
+- `reason.diagnose()` — the model. Refuses to run on a passing verdict,
+  strips any success-like key out of the reply, returns no pass/fail field.
+
+`critic.critique()` calls `reason.diagnose()` for the explanation and keeps
+its own heuristic as the offline fallback. One camera, one explainer.
 
 ---
 

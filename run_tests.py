@@ -27,30 +27,56 @@ MODULES = [
     ("vision", "ArUco ground truth in cm, and occlusion handling"),
     ("schema", "the action menu rejects everything it must"),
     ("critic", "geometry decides pass/fail; a model cannot override it"),
+    ("reason", "VLM diagnosis; refuses to run on a passing verdict"),
     ("planner", "prompt assembly + the fallback path"),
     ("memory", "failure store, retrieval, the ablation wipe"),
     ("narrate", "speech out + device routing"),
     ("voice", "speech in, and the chain that always terminates"),
-    ("glasses", "audio core; video gated off and safe to be absent"),
+    ("glasses", "audio routing + photo ingest, both halves"),
     ("teach", "demonstration recording, waypoints, the no-write boundary"),
 ]
 
-# loop.py's self-test is a flag, not a bare run — a bare run would launch
-# an actual trial loop.
-EXTRA = [(["loop.py", "--self-test"], "loop",
-          "harness arithmetic, IPC merge, escalation")]
+# These three need a flag, not a bare run — each would otherwise run
+# forever: loop.py starts a real trial loop, glasses_bridge.py serves HTTP,
+# supervise.py polls on an interval with no default duration. Note the flag
+# spellings differ (--self-test vs --selftest); that is how they were each
+# written, and unifying them is not worth a merge conflict today.
+EXTRA = [
+    (["loop.py", "--self-test"], "loop",
+     "harness arithmetic, IPC merge, escalation"),
+    (["glasses_bridge.py", "--selftest"], "glasses_bridge",
+     "real HTTP POST against a real server, then exits"),
+    (["supervise.py", "--selftest"], "supervise",
+     "interval glasses-correction loop, no model and no glasses"),
+]
+
+
+TIMEOUT_S = 90
 
 
 def run(cmd, label, why, verbose):
+    """One module's self-test. A hang is reported as a FAIL, not raised.
+
+    The timeout matters: a module that serves forever or polls on an
+    interval will hang here, and letting TimeoutExpired escape kills the
+    whole run and reports nothing about the modules that did pass.
+    """
     t0 = time.monotonic()
-    proc = subprocess.run([sys.executable] + cmd, env=ENV,
-                          capture_output=True, text=True,
-                          stdin=subprocess.DEVNULL, timeout=180)
+    try:
+        proc = subprocess.run([sys.executable] + cmd, env=ENV,
+                              capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=TIMEOUT_S)
+        ok = proc.returncode == 0
+        output = proc.stdout + proc.stderr
+    except subprocess.TimeoutExpired:
+        ok = False
+        output = (f"TIMED OUT after {TIMEOUT_S}s. If this module runs a "
+                  f"server or an interval loop, it needs a --selftest flag "
+                  f"in EXTRA rather than a bare run.")
     dt = time.monotonic() - t0
-    ok = proc.returncode == 0
-    print(f"  {'PASS' if ok else 'FAIL'}  {label:<10} {dt:5.1f}s  {why}")
+    print(f"  {'PASS' if ok else 'FAIL'}  {label:<15} {dt:5.1f}s  {why}")
     if not ok:
-        tail = (proc.stdout + proc.stderr).strip().splitlines()
+        tail = output.strip().splitlines()
         for line in (tail if verbose else tail[-12:]):
             print(f"          {line}")
     return ok

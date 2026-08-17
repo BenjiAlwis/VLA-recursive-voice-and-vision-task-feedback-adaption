@@ -68,6 +68,11 @@ def geometric_verdict(scene_before: Dict, scene_after: Dict) -> Dict:
     err_before = _dist(block_before, zone_before)
     block_moved = _dist(block_before, block_after)
     holding = bool(scene_after.get("holding", False))
+    collided = bool(scene_after.get("collided", False))
+
+    grip_before = scene_before.get("gripper_cm", (0.0, 0.0, 0.0))
+    grip_after = scene_after.get("gripper_cm", (0.0, 0.0, 0.0))
+    arm_moved = _dist(grip_before, grip_after)
 
     return {
         "passed": err_after <= SUCCESS_CM and not holding,
@@ -76,9 +81,27 @@ def geometric_verdict(scene_before: Dict, scene_after: Dict) -> Dict:
         "improved": err_after < err_before - 0.5,
         "block_moved_cm": round(block_moved, 1),
         "still_holding": holding,
-        "collided": bool(scene_after.get("collided", False)),
+        "collided": collided,
         "commanded": bool(scene_after.get("commanded", True)),
         "measured_by": scene_after.get("source", "unknown"),
+
+        # The names reason.heuristic_mode() documents. These are NOT
+        # redundant decoration — reason.py reads 'collision', 'grasped',
+        # 'in_zone' and 'arm_moved_cm', while this function historically
+        # emitted 'collided' and 'still_holding'. The two files were
+        # written in parallel and the mismatch meant Rikin's collision
+        # branch could never fire and his grasped check always saw None.
+        # Same class of drift as the failure-mode vocabulary split; caught
+        # by the assertion in the self-test below.
+        "collision": collided,
+        "arm_moved_cm": round(arm_moved, 1),
+        # "did the gripper end up holding the block", per reason.py's
+        # docstring. Either it still has it, or it moved it — which it
+        # could only do by having held it. NOT keyed off grasp_cm: that
+        # merely records that a close was ATTEMPTED, which is true even
+        # for a grasp that closed on empty air.
+        "grasped": holding or block_moved >= 1.0,
+        "in_zone": err_after <= SUCCESS_CM,
     }
 
 
@@ -205,12 +228,19 @@ away with nothing."
 
 
 def diagnose(verdict: Dict, scene_before: Dict, scene_after: Dict,
-             plan: Dict, frame=None) -> Dict:
+             plan: Dict, frame=None, task: str = "") -> Dict:
     """The VLM explains the failure. Falls back to heuristics on any error.
 
-    Returns a dict WITHOUT a 'passed' key. That omission is deliberate and
-    load-bearing: there is no shape of this return value that could
-    overwrite the geometric verdict when the caller merges them.
+    DELEGATES to reason.diagnose(), which is Rikin's and is the better
+    implementation: it refuses to run on a passing verdict, strips every
+    success-like key out of the model's reply, rejects a prompt_update
+    containing code, and logs its own disagreements. This file used to
+    carry a parallel VLM call doing the same job less carefully — two
+    prompts to keep in sync, two places to leak a verdict.
+
+    Returns a dict WITHOUT a 'passed' key. That omission is load-bearing:
+    no shape of this return value can overwrite the geometric verdict when
+    the caller merges them.
     """
     mode = heuristic_mode(verdict, scene_before, scene_after)
     heur = {
@@ -220,74 +250,43 @@ def diagnose(verdict: Dict, scene_before: Dict, scene_after: Dict,
         "source": "heuristic",
     }
 
-    err = _grasp_error(scene_after)
-    offset_hint = (
-        f"at the moment it CLOSED, the gripper was {err[0]:+.1f}cm x, "
-        f"{err[1]:+.1f}cm y from the block (so the correction is "
-        f"dx_cm={-err[0]:+.1f} dy_cm={-err[1]:+.1f})"
-        if err else "no grasp was attempted this trial")
-
-    content = [{"type": "text", "text": f"""Plan attempted:
-{json.dumps(plan.get('steps', []), indent=1)}
-
-MEASURED (overhead camera, ground truth):
-  block before: {scene_before.get('block_cm')}   after: {scene_after.get('block_cm')}
-  zone:         {scene_after.get('zone_cm')}
-  block moved:  {verdict['block_moved_cm']}cm
-  final error:  {verdict['error_cm']}cm  (threshold {SUCCESS_CM}cm)
-  still holding the block: {verdict['still_holding']}
-  collision detected:      {verdict['collided']}
-  {offset_hint}
-
-Heuristic guess (you may disagree): {heur['failure_mode']}
-
-Diagnose it."""}]
-
-    if frame is not None:
-        try:
-            import cv2
-            ok, buf = cv2.imencode(".jpg", frame)
-            if ok:
-                content.append({"type": "image_url", "image_url": {
-                    "url": "data:image/jpeg;base64,"
-                           + base64.b64encode(buf).decode()}})
-        except Exception as e:                              # noqa: BLE001
-            print(f"[critic] could not attach frame: {e}")
+    try:
+        import reason
+    except Exception as e:                                  # noqa: BLE001
+        print(f"[critic] reason.py unavailable, using the heuristic: {e}")
+        return heur
 
     try:
-        import planner
-        resp = planner.client().chat.completions.create(
-            model=planner.MODEL,
-            messages=[{"role": "system", "content": DIAGNOSE_SYSTEM},
-                      {"role": "user", "content": content}],
-            temperature=0.3,
-            max_tokens=250,
+        result = reason.diagnose(
+            task or "pick up the block and place it in the target zone",
+            verdict,
+            frame_after=frame,
+            actions=[s.get("action") for s in plan.get("steps", [])],
         )
-        raw = json.loads(planner.strip_fences_safe(
-            resp.choices[0].message.content))
-        if not isinstance(raw, dict):
-            raise ValueError("diagnosis is not an object")
-
-        # A model that invents a mode gets the heuristic's instead. We keep
-        # its sentence — the prose is the part worth having.
-        if raw.get("failure_mode") not in FAILURE_MODES:
-            print(f"[critic] model invented mode "
-                  f"{raw.get('failure_mode')!r}; using the heuristic")
-            raw["failure_mode"] = heur["failure_mode"]
-
-        # Strip anything verdict-shaped before it can reach the merge.
-        for banned in ("passed", "success", "error_cm", "succeeded"):
-            raw.pop(banned, None)
-
-        raw.setdefault("diagnosis", heur["diagnosis"])
-        raw.setdefault("suggested_fix", heur["suggested_fix"])
-        raw["source"] = "vlm"
-        _log_if_disagree(raw, heur, verdict)
-        return raw
-
     except Exception as e:                                  # noqa: BLE001
-        print(f"[critic] diagnosis fell back to the heuristic: {e}")
+        print(f"[critic] reason.diagnose raised, using the heuristic: {e}")
         return heur
+
+    if not result:
+        return heur
+
+    # reason.py returns prompt_update; this file's callers (narrate, memory)
+    # expect suggested_fix. Carry the measured offset through as the fix
+    # when we have one, because it is strictly more actionable than prose.
+    merged = dict(result)
+    merged.setdefault("diagnosis", heur["diagnosis"])
+    merged["suggested_fix"] = (result.get("prompt_update")
+                               or heur["suggested_fix"])
+    if mode == "missed_grasp" and _grasp_error(scene_after):
+        merged["suggested_fix"] = heur["suggested_fix"]
+
+    # Belt and braces. reason.py already strips these; if that ever
+    # regresses, it must not reach the merge in critique().
+    for banned in ("passed", "success", "succeeded", "ok", "solved"):
+        merged.pop(banned, None)
+
+    _log_if_disagree(merged, heur, verdict)
+    return merged
 
 
 def _log_if_disagree(vlm: Dict, heur: Dict, verdict: Dict) -> None:
@@ -315,7 +314,7 @@ def _log_if_disagree(vlm: Dict, heur: Dict, verdict: Dict) -> None:
 # ---------------- the one function the loop calls ----------------
 
 def critique(scene_before: Dict, scene_after: Dict, plan: Dict,
-             frame=None, use_llm: bool = True) -> Dict:
+             frame=None, use_llm: bool = True, task: str = "") -> Dict:
     """Geometry first, always. The model only ever adds prose.
 
     The merge order below is the safety property: `verdict` is spread
@@ -334,7 +333,8 @@ def critique(scene_before: Dict, scene_after: Dict, plan: Dict,
                 "suggested_fix": None, "source": "geometry"}
 
     if use_llm:
-        explanation = diagnose(verdict, scene_before, scene_after, plan, frame)
+        explanation = diagnose(verdict, scene_before, scene_after, plan,
+                               frame, task=task)
     else:
         mode = heuristic_mode(verdict, scene_before, scene_after)
         explanation = {
@@ -375,12 +375,21 @@ if __name__ == "__main__":
         assert v["passed"] is expect, f"{label}: expected passed={expect}"
 
     print("\n=== heuristic modes, all five reachable ===")
+    # The gripper position matters here. critic.heuristic_mode keys off the
+    # arm's `commanded` flag, reason.heuristic_mode keys off arm_moved_cm —
+    # so a fixture that leaves the gripper parked reads as "no motion" to
+    # reason.py even when the case under test is a missed grasp. Every
+    # non-no_motion case therefore moves the arm, as a real trial does.
+    reached = (18.0, 24.0, 1.0)         # arm travelled to the block
+    placed = (-16.0, 22.0, 1.0)         # arm travelled to the zone
     expectations = [
         ("no_motion",      start, scene((18.0, 24.0), commanded=False)),
-        ("collision",      start, scene((5.0, 23.0), collided=True)),
-        ("missed_grasp",   start, scene((18.0, 24.0))),
-        ("dropped_early",  start, scene((-16.0, 22.0), holding=True)),
-        ("wrong_position", start, scene((-6.0, 18.0))),
+        ("collision",      start, scene((5.0, 23.0), gripper=reached,
+                                        collided=True)),
+        ("missed_grasp",   start, scene((18.0, 24.0), gripper=reached)),
+        ("dropped_early",  start, scene((-16.0, 22.0), gripper=placed,
+                                        holding=True)),
+        ("wrong_position", start, scene((-6.0, 18.0), gripper=placed)),
     ]
     seen = set()
     for expect, before, after in expectations:
@@ -422,5 +431,37 @@ if __name__ == "__main__":
           f"mode={result['failure_mode']} err={result['error_cm']}cm")
     assert not result["passed"], "the naive plan must fail, or nothing is learned"
     assert result["failure_mode"] == "missed_grasp"
+
+    print("\n=== the verdict carries every key reason.py reads ===")
+    # reason.heuristic_mode() documents exactly these. They were missing
+    # once, which silently disabled Rikin's collision and grasp branches.
+    import reason
+    v = geometric_verdict(start, scene((5.0, 23.0), collided=True))
+    for key in ("collision", "grasped", "in_zone", "arm_moved_cm",
+                "block_moved_cm", "error_cm", "passed"):
+        assert key in v, f"reason.py reads {key!r}, verdict does not carry it"
+    assert reason.heuristic_mode(v) == "collision", \
+        (f"reason.py could not see the collision: got "
+         f"{reason.heuristic_mode(v)}. The two files' key names have drifted.")
+    print(f"  reason.heuristic_mode agrees: {reason.heuristic_mode(v)}")
+
+    # The contract is that reason.py can READ our verdict and return a
+    # VALID mode — not that it returns the SAME mode. The two estimators
+    # see different data on purpose: this file has still_holding and the
+    # latched grasp position, reason.py does not, so it cannot separate
+    # "dropped mid-traverse" from "placed but off target". Forcing them to
+    # agree would throw away the finer signal, and their disagreements are
+    # exactly what logs/critic_disagreements.jsonl exists to collect.
+    print("\n  mode-by-mode, critic vs reason (disagreement is expected):")
+    for expect, before, after in expectations:
+        vv = geometric_verdict(before, after)
+        theirs = reason.heuristic_mode(vv)
+        assert theirs in FAILURE_MODES, \
+            f"reason.py returned {theirs!r}, outside the shared vocabulary"
+        flag = "  same" if theirs == expect else "  <- differs, logged"
+        print(f"    critic={expect:<15} reason={theirs:<15}{flag}")
+
+    assert set(reason.FAILURE_MODES) == set(FAILURE_MODES), \
+        "reason.py and memory.py disagree about the failure vocabulary"
 
     print("\ncritic smoke test passed")
