@@ -1,13 +1,60 @@
-# The Dog That Knows It Failed
+<div align="center">
+  <h1>The Arm That Knows It Failed</h1>
+</div>
 
-A quadruped that attempts a task, measures its own failure, says out loud
-what went wrong, and retries — accumulating reusable skills and a failure
-memory that transfers to the next task.
+<div align="center">
+  <h3>A robot arm that fails at a task, says out loud why it failed, and
+  gets it right on the next attempt — no retraining, no teleoperation.</h3>
+</div>
 
-**Perception** ArUco geometry + Go2 front camera →
-**Reasoning** Nebius VLM planner + critic →
-**Action** SportClient primitives →
-**Feedback** failure memory → back into the planner.
+<div align="center">
+  <img src="https://img.shields.io/badge/arm-SO--101-black" alt="Arm: SO-101">
+  <img src="https://img.shields.io/badge/platform-macOS-black" alt="Platform: macOS">
+  <img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="Python 3.11+">
+  <img src="https://img.shields.io/badge/inference-Nebius-6f42c1" alt="Inference: Nebius">
+  <img src="https://img.shields.io/badge/training-none-brightgreen" alt="No training">
+</div>
+
+<br>
+
+An SO-101 arm tries to pick up a block and place it in a target zone. A
+fixed camera measures what actually happened and decides pass or fail. On a
+failure a vision-language model explains *why* — "I closed my gripper two
+centimetres short of the block" — the arm speaks that diagnosis aloud, and
+the explanation is rewritten into a new instruction for the controller. The
+next attempt is a different attempt. Nothing is retrained; the improvement
+lives entirely in the prompt and in a memory of past failures.
+
+When it fails twice in a row it stops guessing and asks for help. A human
+moves the **leader** arm through the motion by hand, that trajectory is
+saved as a named skill, and the arm replays it.
+
+```
+camera  →  sensing  →  reasoning  →  prompt update  →  VLA  →  arm moves
+(fixed)   (pass/fail)  (why + fix)     (Red→Blue)     (Blue)      │
+                            ↑                                     │
+                         memory  ←──── failure recorded ←──────────┘
+                     (past failures shape the next prompt)
+
+    after 2 failures:  human moves the leader arm  →  skill saved  →  replayed
+```
+
+Two rules hold the whole thing up, and both are enforced in code rather
+than trusted:
+
+- **The camera decides pass/fail — the model only explains why.** A critic
+  that hallucinates success stops the learning loop and makes the arm look
+  broken on stage. `reason.diagnose()` refuses to run on a passing verdict,
+  strips any success-like key out of the model's reply, and returns a dict
+  with no pass/fail field at all.
+- **The model emits JSON only, against a fixed schema.** Non-JSON, an
+  unknown failure mode, an empty diagnosis, or a `prompt_update` containing
+  code is discarded and a geometry-only fallback is used instead. The
+  demo never depends on a model behaving.
+
+The self-improvement is measurable, not asserted: `memory.wipe()` is an
+ablation switch, so the same task can be run with and without memory and
+the trials-to-success compared.
 
 ---
 
