@@ -133,18 +133,42 @@ def _open_leader():
     """Open the LEADER arm READ-ONLY and return something with
     get_observation().
 
-    UNVERIFIED: lerobot is not installed in this tree, and its module
-    paths have moved across releases. The candidates below are tried in
-    order. If none import, this raises with a clear message rather than
-    silently degrading to fabricated data — a mock trajectory recorded
-    while a human is physically demonstrating is worse than a visible
-    failure, because it looks like it worked.
+    The leader is a lerobot TELEOPERATOR of type `so101_leader` — confirmed
+    against Team Yellow's setup in so101_yellow/scripts/05_teleoperate.sh,
+    which drives it as `--teleop.type=so101_leader`. The class name is still
+    inferred, so the candidates below are tried in order; if none import this
+    raises with a clear message rather than silently degrading to fabricated
+    data. A mock trajectory recorded while a human is physically
+    demonstrating looks like it worked, which is worse than an error.
+
+    THE ID MATTERS AS MUCH AS THE PORT. lerobot loads calibration by `id`,
+    and a mismatched one silently loads the wrong calibration or none at
+    all — at which point every joint value is meaningless and the recorded
+    demonstration is junk that looks fine. So the id is read from the SAME
+    env vars Team Yellow calibrates with (SO101_LEADER_ID, e.g.
+    "yellow_leader") rather than hardcoded.
+
+    NOTE: lerobot needs Python >= 3.12 and the [feetech] extra — SO-101 uses
+    Feetech STS3215 servos, not Dynamixel.
 
     Only get_observation() is ever called. No send_action, ever.
     """
-    port = os.getenv("LEADER_PORT")
+    port = os.getenv("LEADER_PORT") or os.getenv("SO101_LEADER_PORT")
     if not port:
-        raise RuntimeError("LEADER_PORT is not set (e.g. /dev/tty.usbmodem1101)")
+        raise RuntimeError(
+            "no leader port. Set SO101_LEADER_PORT (or LEADER_PORT) — see "
+            "so101_yellow/configs/leader.env, or run "
+            "so101_yellow/scripts/01_find_ports.sh")
+
+    arm_id = os.getenv("LEADER_ID") or os.getenv("SO101_LEADER_ID")
+    if not arm_id:
+        arm_id = "leader"
+        print("[teach] WARNING: no SO101_LEADER_ID set, falling back to "
+              f"{arm_id!r}. If the arm was calibrated under a different id "
+              "lerobot will load the wrong calibration or none, and the "
+              "recorded joint values will be meaningless. Check "
+              "so101_yellow/configs/leader.env.")
+    print(f"[teach] leader port={port} id={arm_id}")
 
     errors = []
     candidates = (
@@ -157,7 +181,7 @@ def _open_leader():
             mod = __import__(module, fromlist=[cls_name, cfg_name])
             cls = getattr(mod, cls_name)
             cfg_cls = getattr(mod, cfg_name)
-            arm = cls(cfg_cls(port=port, id="leader"))
+            arm = cls(cfg_cls(port=port, id=arm_id))
             connect = getattr(arm, "connect", None)
             if connect:
                 connect()
