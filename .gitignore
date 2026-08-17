@@ -12,4 +12,11 @@ logs/
 # Photos dropped in by a human during escalation.
 help_frames/
 
+# The Red <-> Blue IPC channel. The DIRECTORY is committed (via
+# shared/.gitkeep) so it exists on a fresh clone and neither team has to
+# guess why their writes vanish. The runtime messages inside it are not
+# committed — they are live state with timestamps, and a stale seed file
+# checked into git would be read as a real directive on startup.
+shared/*.json
+
 .DS_Store
