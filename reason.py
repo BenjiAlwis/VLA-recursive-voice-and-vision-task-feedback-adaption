@@ -127,8 +127,18 @@ def _encode_frame(frame: Any) -> Optional[str]:
             if not os.path.exists(path):
                 print(f"[reason] frame not found: {path}")
                 return None
+            # Mime comes from an explicit map, never a default. Labelling an
+            # unknown file "image/jpeg" is how a HEIC from an iPhone reaches
+            # the endpoint and fails as an opaque API error instead of an
+            # actionable "convert this" message.
             ext = os.path.splitext(path)[1].lower()
-            mime = "image/png" if ext == ".png" else "image/jpeg"
+            mime = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                    ".png": "image/png", ".webp": "image/webp"}.get(ext)
+            if mime is None:
+                print(f"[reason] refusing frame {os.path.basename(path)}: "
+                      f"{ext or 'no extension'} is not a format the vision "
+                      f"endpoint accepts (use JPEG or PNG)")
+                return None
             with open(path, "rb") as f:
                 return f"data:{mime};base64,{base64.b64encode(f.read()).decode()}"
         import cv2

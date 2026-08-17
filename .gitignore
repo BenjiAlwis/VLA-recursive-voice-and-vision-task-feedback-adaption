@@ -20,3 +20,6 @@ help_frames/
 shared/*.json
 
 .DS_Store
+
+# Frames pushed from the glasses app. Runtime capture, not source.
+glasses_frames/
