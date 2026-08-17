@@ -217,7 +217,15 @@ def escalate(arm, task: str, verdict: Dict, corrections: List[str],
 
     narrate.speak("Please show me on the leader arm.")
     name = f"taught_{int(time.time())}"
-    source = "leader" if os.getenv("LEADER_PORT") else "mock"
+    # Accept Team Yellow's variable name too. Gating on the bare
+    # LEADER_PORT alone meant that with only SO101_LEADER_PORT set — which
+    # is what their configs/leader.env actually defines — this silently
+    # recorded a MOCK trajectory while a human stood there physically
+    # demonstrating. It looks like it worked, which is the worst way to
+    # fail.
+    source = ("leader"
+              if (os.getenv("LEADER_PORT") or os.getenv("SO101_LEADER_PORT"))
+              else "mock")
     skill = teach.record_demonstration(
         name, seconds=int(os.getenv("TEACH_SECONDS", "8")),
         source=source, task=task)

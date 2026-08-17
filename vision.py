@@ -35,9 +35,47 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 MARKER_CM = float(os.getenv("ARUCO_MARKER_CM", "4.0"))
-OVERHEAD_INDEX = int(os.getenv("OVERHEAD_CAM", "0"))
-WRIST_INDEX = int(os.getenv("WRIST_CAM", "1"))
+
+# Team Yellow's names first (so101_yellow/configs/cameras.env), then ours.
+#
+# THE OVERHEAD CAMERA MUST BE FIXED, AND IT MUST NOT BE THE WRIST CAMERA.
+# Their cameras.env defines CAM_WRIST_INDEX=0 and says in as many words
+# that it is "mounted on the end effector, not a fixed workspace view" —
+# while this file used to default OVERHEAD_CAM to 0. On that hardware the
+# critic's ground truth would have been measured through a camera bolted
+# to the moving arm: every marker appears to move when the arm moves, so
+# the block's "position" changes without the block going anywhere.
+#
+# That is not a degraded measurement, it is a meaningless one, and it
+# would be measuring the one thing in this system that is not allowed to
+# be wrong. Hence the guard in _check_camera_roles() rather than a default
+# that quietly does the wrong thing.
+WRIST_INDEX = int(os.getenv("WRIST_CAM")
+                  or os.getenv("CAM_WRIST_INDEX") or "1")
+_OVERHEAD_RAW = os.getenv("OVERHEAD_CAM") or os.getenv("CAM_OVERHEAD_INDEX")
+OVERHEAD_INDEX = int(_OVERHEAD_RAW) if _OVERHEAD_RAW else 0
+
 DICT_NAME = os.getenv("ARUCO_DICT", "DICT_4X4_50")
+
+
+def _check_camera_roles() -> Optional[str]:
+    """Why the ground-truth camera cannot be trusted, or None if it can.
+
+    Called on every read_scene() that opens a real camera. Cheap, and the
+    failure it catches is silent and total.
+    """
+    if OVERHEAD_INDEX == WRIST_INDEX:
+        return (f"the overhead and wrist cameras are both index "
+                f"{OVERHEAD_INDEX}. The critic would measure ground truth "
+                f"through a camera mounted on the moving arm, which makes "
+                f"every measurement meaningless. Set CAM_OVERHEAD_INDEX to "
+                f"a SEPARATE, FIXED camera looking down at the workspace.")
+    if _OVERHEAD_RAW is None and os.getenv("CAM_WRIST_INDEX") == "0":
+        return ("no CAM_OVERHEAD_INDEX is set, and CAM_WRIST_INDEX=0 — so "
+                "the default overhead index 0 IS the wrist camera. Add a "
+                "second, fixed camera and set CAM_OVERHEAD_INDEX, or run "
+                "on the mock. Do not measure ground truth from the wrist.")
+    return None
 
 ID_BLOCK, ID_ZONE, ID_GRIPPER, ID_ORIGIN = 0, 1, 2, 3
 
@@ -64,8 +102,17 @@ def _open(which: str):
     return cap
 
 
+_warned_roles = False
+
+
 def capture(which: str = "overhead") -> Optional[np.ndarray]:
     """One BGR frame, or None. Never raises."""
+    global _warned_roles
+    if which == "overhead" and not _warned_roles:
+        problem = _check_camera_roles()
+        if problem:
+            print(f"\n[vision] ⚠ GROUND TRUTH IS NOT TRUSTWORTHY: {problem}\n")
+        _warned_roles = True
     try:
         cap = _open(which)
         if cap is None:
@@ -318,5 +365,33 @@ if __name__ == "__main__":
     if args.save:
         cv2.imwrite(args.save, annotate(canvas, scene))
         print(f"wrote {args.save}")
+
+    print("\n=== the camera-role guard ===")
+    import importlib
+    for env, expect_problem, label in (
+        ({"OVERHEAD_CAM": "0", "WRIST_CAM": "0"}, True,
+         "same index for both"),
+        ({"CAM_WRIST_INDEX": "0"}, True,
+         "Team Yellow's config with no overhead camera"),
+        ({"CAM_OVERHEAD_INDEX": "2", "CAM_WRIST_INDEX": "0"}, False,
+         "a separate fixed overhead camera"),
+    ):
+        saved = {k: os.environ.get(k) for k in
+                 ("OVERHEAD_CAM", "WRIST_CAM", "CAM_WRIST_INDEX",
+                  "CAM_OVERHEAD_INDEX")}
+        for k in saved:
+            os.environ.pop(k, None)
+        os.environ.update(env)
+        import vision as v
+        importlib.reload(v)
+        problem = v._check_camera_roles()
+        print(f"  {label:<42} -> "
+              f"{'REFUSED' if problem else 'ok'}")
+        assert bool(problem) == expect_problem, (label, problem)
+        for k, val in saved.items():
+            os.environ.pop(k, None)
+            if val is not None:
+                os.environ[k] = val
+    importlib.reload(v)
 
     print("\nvision smoke test passed (synthetic — run --live before the demo)")

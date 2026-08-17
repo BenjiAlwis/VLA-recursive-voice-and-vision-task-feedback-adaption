@@ -64,6 +64,37 @@ JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex",
 JOINT_KEYS = [j + ".pos" for j in JOINTS]
 
 
+def _follower_identity():
+    """(port, id) for the follower, from Team Yellow's env names.
+
+    Reads SO101_FOLLOWER_PORT / SO101_FOLLOWER_ID — the SAME variables
+    so101_yellow/configs/follower.env defines and their calibrate script
+    writes — falling back to the older bare FOLLOWER_PORT / FOLLOWER_ID.
+
+    THE ID MATTERS AS MUCH AS THE PORT. lerobot loads calibration by id, so
+    a wrong one silently loads the wrong calibration or none at all, and
+    every joint value after that is meaningless while looking perfectly
+    normal. teach.py hit this for the leader; the follower is the same
+    trap. Same warning, deliberately.
+    """
+    port = os.getenv("SO101_FOLLOWER_PORT") or os.getenv("FOLLOWER_PORT")
+    if not port:
+        raise RuntimeError(
+            "no follower port. Set SO101_FOLLOWER_PORT (or FOLLOWER_PORT) — "
+            "see so101_yellow/configs/follower.env, or run "
+            "so101_yellow/scripts/01_find_ports.sh")
+
+    arm_id = os.getenv("SO101_FOLLOWER_ID") or os.getenv("FOLLOWER_ID")
+    if not arm_id:
+        arm_id = "follower"
+        print(f"[so101] WARNING: no SO101_FOLLOWER_ID set, falling back to "
+              f"{arm_id!r}. If the arm was calibrated under a different id "
+              f"lerobot will load the wrong calibration or none, and every "
+              f"joint value will be meaningless. Check "
+              f"so101_yellow/configs/follower.env.")
+    return port, arm_id
+
+
 class ArmBase:
     """Every backend implements exactly this. Nothing more."""
 
@@ -425,10 +456,7 @@ class SO101Arm(ArmBase):
     RECONNECT_PAUSE_S = 0.6
 
     def __init__(self):
-        self.port = os.getenv("FOLLOWER_PORT")
-        if not self.port:
-            raise RuntimeError(
-                "FOLLOWER_PORT is not set (e.g. /dev/tty.usbmodem1101)")
+        self.port, self.arm_id = _follower_identity()
         self.poses = _load_poses()
         if not self.poses:
             raise RuntimeError(
@@ -442,6 +470,7 @@ class SO101Arm(ArmBase):
     # ---- connection ----
 
     def _connect(self):
+        print(f"[so101] follower port={self.port} id={self.arm_id}")
         errors = []
         candidates = (
             ("lerobot.robots.so101_follower", "SO101Follower",
@@ -454,7 +483,7 @@ class SO101Arm(ArmBase):
                 mod = __import__(module, fromlist=[cls_name, cfg_name])
                 cls = getattr(mod, cls_name)
                 cfg_cls = getattr(mod, cfg_name)
-                arm = cls(cfg_cls(port=self.port, id="follower"))
+                arm = cls(cfg_cls(port=self.port, id=self.arm_id))
                 connect = getattr(arm, "connect", None)
                 if connect:
                     connect()
@@ -574,9 +603,10 @@ def calibrate() -> None:
     minutes, done once, and nothing else in the build works until it is.
     """
     arm = SO101Arm.__new__(SO101Arm)          # skip the poses precondition
-    arm.port = os.getenv("FOLLOWER_PORT")
-    if not arm.port:
-        raise SystemExit("FOLLOWER_PORT is not set")
+    try:
+        arm.port, arm.arm_id = _follower_identity()
+    except RuntimeError as e:
+        raise SystemExit(str(e))
     arm.poses = {}
     arm._connect()
 

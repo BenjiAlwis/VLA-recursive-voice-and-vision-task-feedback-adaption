@@ -102,9 +102,15 @@ def main():
 
     print("""
 Everything offline is green. Still UNVERIFIED against hardware:
-  - SO101Arm            needs FOLLOWER_PORT + `python arm_api.py --calibrate`
-  - teach.py --leader   needs LEADER_PORT
-  - vision.py --live    needs the overhead camera and printed markers
+  - SO101Arm            needs SO101_FOLLOWER_PORT + SO101_FOLLOWER_ID
+                        (so101_yellow/configs/follower.env), then
+                        `python arm_api.py --calibrate`
+  - teach.py --leader   needs SO101_LEADER_PORT + SO101_LEADER_ID
+  - vision.py --live    needs printed markers AND a SECOND fixed overhead
+                        camera. CAM_OVERHEAD_INDEX is blank in
+                        so101_yellow/configs/cameras.env — until it is
+                        set, there is no ground truth and pass/fail
+                        cannot be measured on real hardware.
   - planner.py --verify needs NEBIUS_API_KEY  <- do this one first
 """)
     return 0
