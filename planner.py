@@ -124,10 +124,18 @@ RELEVANT PAST FAILURES (yours, on this task):
 
 
 def _encode(frame) -> Optional[str]:
+    """Frame -> a complete data URL, or None.
+
+    Delegates to reason._encode_frame, which already accepts BOTH a decoded
+    array (the wrist camera) and a path (a glasses photo), and maps the
+    extension to a mime type instead of defaulting to image/jpeg. That last
+    part matters: an iPhone HEIC labelled as JPEG reaches the endpoint and
+    fails as an opaque API error rather than an actionable "convert this".
+    Reimplementing it here would mean reproducing that bug.
+    """
     try:
-        import cv2
-        ok, buf = cv2.imencode(".jpg", frame)
-        return base64.b64encode(buf).decode() if ok else None
+        import reason
+        return reason._encode_frame(frame)
     except Exception as e:                                  # noqa: BLE001
         print(f"[planner] could not encode frame: {e}")
         return None
@@ -147,10 +155,9 @@ def plan(task: str, scene: Dict, memories: str, frame=None,
     content: List[Dict] = [{"type": "text", "text": user_msg}]
 
     if frame is not None and VISION:
-        encoded = _encode(frame)
-        if encoded:
-            content.append({"type": "image_url", "image_url": {
-                "url": f"data:image/jpeg;base64,{encoded}"}})
+        url = _encode(frame)
+        if url:
+            content.append({"type": "image_url", "image_url": {"url": url}})
 
     messages = [{"role": "system", "content": SYSTEM},
                 {"role": "user", "content": content}]
@@ -276,5 +283,29 @@ if __name__ == "__main__":
     assert p["rationale"] == "fixed pick-and-place (no model)"
     assert schema.validate_plan(p)["steps"] == p["steps"], \
         "the fallback must satisfy our own validator"
+
+    print("\n=== frames encode from BOTH a wrist array and a glasses path ===")
+    import tempfile
+    import numpy as np
+    arr = np.zeros((8, 8, 3), dtype=np.uint8)
+    url_arr = _encode(arr)
+    assert url_arr and url_arr.startswith("data:image/jpeg;base64,"), url_arr
+    print(f"  ndarray (wrist cam) -> {url_arr[:32]}… ({len(url_arr)} chars)")
+
+    jpg = os.path.join(tempfile.gettempdir(), "planner_frame_smoke.jpg")
+    with open(jpg, "wb") as f:
+        f.write(b"\xff\xd8\xff\xe0" + b"\x00" * 32 + b"\xff\xd9")
+    url_path = _encode(jpg)
+    assert url_path and url_path.startswith("data:image/jpeg;base64,"), url_path
+    print(f"  path (glasses photo) -> {url_path[:32]}… ({len(url_path)} chars)")
+
+    heic = jpg.replace(".jpg", ".HEIC")
+    with open(heic, "wb") as f:
+        f.write(b"\x00\x00\x00\x18ftypheic")
+    assert _encode(heic) is None, "HEIC must be refused, not mislabelled"
+    print("  HEIC refused rather than sent as image/jpeg")
+    assert _encode(None) is None and _encode("/nope/missing.jpg") is None
+    for pth in (jpg, heic):
+        os.remove(pth)
 
     print("\nplanner offline test passed — run --verify with a key before the demo")

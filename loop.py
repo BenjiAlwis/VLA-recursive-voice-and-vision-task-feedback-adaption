@@ -154,12 +154,20 @@ def log_trial(rec: Dict) -> None:
 # ---------------- escalation ----------------
 
 def escalate(arm, task: str, verdict: Dict, corrections: List[str],
-             use_voice: bool, allow_teaching: bool) -> Optional[Dict]:
+             use_voice: bool, allow_teaching: bool) -> Dict:
     """Two consecutive failures. Ask a human.
 
-    Cheapest signal first: a spoken correction costs seconds and often
-    fixes it. Only when that is unavailable or already tried do we ask for
-    a full physical demonstration, which costs a minute of stage time.
+    Escalates cheapest-first, because each rung costs more stage time than
+    the last:
+
+        1. a spoken correction        seconds, usually enough
+        2. a glasses photo            ~20s, shows what the fixed camera cannot
+        3. a leader-arm demonstration ~a minute, but teaches a whole skill
+
+    Returns {"replay": <payload or None>, "view": <image path or None>}.
+    Both may be None — every caller must cope, because with the glasses
+    unpaired and teaching disabled this function has nothing to offer and
+    the run must continue regardless.
     """
     mode = verdict.get("failure_mode", "the same mistake")
 
@@ -167,10 +175,12 @@ def escalate(arm, task: str, verdict: Dict, corrections: List[str],
     # "can you help me?" during a --no-teaching ablation sweep is a promise
     # to an audience that nothing will follow up on, and it makes the
     # control runs sound broken rather than controlled.
+    out: Dict = {"replay": None, "view": None}
+
     if not use_voice and not allow_teaching:
         print(f"[loop] {TEACH_AFTER} consecutive failures; "
               f"escalation disabled for this run")
-        return None
+        return out
 
     narrate.speak(f"I have failed twice with {str(mode).replace('_', ' ')}. "
                   f"Can you help me?")
@@ -185,10 +195,25 @@ def escalate(arm, task: str, verdict: Dict, corrections: List[str],
         if said:
             corrections.append(said)
             narrate.speak("Understood. Let me try that.")
-            return None                 # the words go into the next prompt
+            return out                  # the words go into the next prompt
+
+    # Rung 2: a photo through the glasses. master_reference section 5 routes
+    # Meta Video to the PLANNER as scene context, never to the critic — a
+    # human-held camera showing an angle the fixed camera cannot is exactly
+    # the thing that must not be allowed near a pass/fail decision.
+    #
+    # Silent no-op when GLASSES_BACKEND=off, which is the T-1:00 cut.
+    try:
+        import glasses
+        out["view"] = glasses.request_view(
+            f"I keep getting {str(mode).replace('_', ' ')}.", timeout_s=20)
+    except Exception as e:                                  # noqa: BLE001
+        print(f"[loop] glasses view unavailable: {e}")
+    if out["view"]:
+        return out                      # try again with the human's view
 
     if not allow_teaching:
-        return None
+        return out
 
     narrate.speak("Please show me on the leader arm.")
     name = f"taught_{int(time.time())}"
@@ -198,13 +223,14 @@ def escalate(arm, task: str, verdict: Dict, corrections: List[str],
         source=source, task=task)
     if not skill:
         narrate.speak("I could not record that. I will keep trying myself.")
-        return None
+        return out
 
     # teach.py queues; WE emit. Consume-once, so the skill is not replayed
     # forever once it has been handed over.
     teach.request_replay(name, reason=f"human demonstrated after {mode}")
     narrate.announce_learned(name)
-    return teach.take_pending_replay()
+    out["replay"] = teach.take_pending_replay()
+    return out
 
 
 # ---------------- the loop ----------------
@@ -218,6 +244,7 @@ def run_task(arm, task: str, max_trials: int = 5, use_memory: bool = True,
     consecutive = 0
     corrections: List[str] = []
     pending_replay: Optional[Dict] = None
+    help_view: Optional[str] = None     # a glasses photo, for ONE next trial
 
     for trial in range(1, max_trials + 1):
         print(f"\n─── trial {trial}/{max_trials} — {task}")
@@ -227,7 +254,14 @@ def run_task(arm, task: str, max_trials: int = 5, use_memory: bool = True,
             arm.reset_trial()
 
         scene_before = arm.get_scene()
-        frame = arm.get_frame("wrist")
+        # The glasses photo, when a human just supplied one, outranks the
+        # wrist camera as planner context — it was taken deliberately to
+        # show what the fixed view could not. Consumed once: a photo of the
+        # previous failure describes a world that no longer exists.
+        frame = help_view or arm.get_frame("wrist")
+        if help_view:
+            print(f"  👓 planning with the glasses view: {help_view}")
+        help_view = None
         mems = memory.for_prompt(task, surface) if use_memory \
             else "(memory disabled for this run)"
 
@@ -320,8 +354,10 @@ def run_task(arm, task: str, max_trials: int = 5, use_memory: bool = True,
 
         consecutive += 1
         if consecutive >= TEACH_AFTER and trial < max_trials:
-            pending_replay = escalate(arm, task, verdict, corrections,
-                                      use_voice, allow_teaching)
+            helped = escalate(arm, task, verdict, corrections,
+                              use_voice, allow_teaching)
+            pending_replay = helped.get("replay")
+            help_view = helped.get("view")
             consecutive = 0
 
     return {"solved": False, "trials": max_trials,
@@ -527,9 +563,23 @@ def self_test() -> None:
     try:
         got = escalate(arm_api.MockArm(), "task", {"failure_mode": "missed_grasp"},
                        [], use_voice=False, allow_teaching=False)
-        assert got is None and not spoken, \
+        assert got == {"replay": None, "view": None}, got
+        assert not spoken, \
             f"must not promise help it cannot deliver, said: {spoken}"
-        print("  --no-teaching + no voice -> silent")
+        print("  --no-teaching + no voice -> silent, {replay: None, view: None}")
+
+        # Every escalation path must return both keys. A caller that reads
+        # .get("view") on a None would crash the run at the exact moment a
+        # human is trying to help, which is the worst possible time.
+        os.environ["GLASSES_BACKEND"] = "off"
+        import importlib
+        import glasses as g
+        importlib.reload(g)
+        got2 = escalate(arm_api.MockArm(), "task",
+                        {"failure_mode": "collision"}, [],
+                        use_voice=False, allow_teaching=True)
+        assert set(got2) == {"replay", "view"}, got2
+        print(f"  glasses off + teaching on -> keys {sorted(got2)}")
     finally:
         narrate.speak = real_speak
 
