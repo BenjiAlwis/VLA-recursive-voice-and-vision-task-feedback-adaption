@@ -98,12 +98,22 @@ def _smooth(t: float) -> float:
 
 
 def _mock_pose(p: float) -> Dict[str, float]:
-    """Scripted leader pose at normalised progress p in [0, 1]."""
+    """Scripted leader pose at normalised progress p in [0, 1].
+
+    Human motion is eased, EXCEPT across the gripper transitions. A grasp
+    is abrupt, and smoothstepping it ramps velocity from zero at both ends,
+    which lowers peak speed and costs the snap waypoints in the
+    motion-weighted downsampler. Measured over a 240-sample run: easing the
+    snap gives a 1.88x density ratio against idle motion, linear gives
+    2.43x. Easing it here was fighting the design intent.
+    """
     p = max(0.0, min(1.0, p))
     for (p0, a), (p1, b) in zip(_KEYFRAMES, _KEYFRAMES[1:]):
         if p <= p1 or p1 == 1.0:
             span = p1 - p0
-            f = _smooth((p - p0) / span) if span > 0 else 0.0
+            raw = (p - p0) / span if span > 0 else 0.0
+            snap = abs(b[5] - a[5]) > 1.0          # index 5 is the gripper
+            f = raw if snap else _smooth(raw)
             return {k: a[i] + (b[i] - a[i]) * f + random.gauss(0, MOCK_NOISE)
                     for i, k in enumerate(KEYS)}
     return {k: _KEYFRAMES[-1][1][i] for i, k in enumerate(KEYS)}
